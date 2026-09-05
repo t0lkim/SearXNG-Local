@@ -19,6 +19,8 @@ Self-managing multi-exit proxy router.
 
 ### Changed
 
+- Proxy watch starts automatically with the container when `vpn-configs/` has configs
+- `stop`, `teardown`, and `reset` now stop the proxy watch and wireproxy tunnels
 - Update README with proxy routing documentation
 
 ## [0.2.0] — 2026-09-04

@@ -92,11 +92,13 @@ setup() {
     state="$(podman container inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "unknown")"
     if [[ "$state" == "running" ]]; then
       info "SearXNG is already running at ${BASE_URL}"
+      start_proxy_watch
       return 0
     fi
     info "Starting existing container..."
     podman start "$CONTAINER_NAME"
     info "SearXNG running at ${BASE_URL}"
+    start_proxy_watch
     return 0
   fi
 
@@ -134,9 +136,11 @@ setup() {
     "$IMAGE"
 
   info "SearXNG running at ${BASE_URL}"
+  start_proxy_watch
 }
 
 stop() {
+  stop_proxy_watch
   if podman container exists "$CONTAINER_NAME" 2>/dev/null; then
     info "Stopping SearXNG..."
     podman stop "$CONTAINER_NAME"
@@ -147,6 +151,7 @@ stop() {
 }
 
 teardown() {
+  stop_proxy_watch
   stop 2>/dev/null || true
   if podman container exists "$CONTAINER_NAME" 2>/dev/null; then
     info "Removing container..."
@@ -225,6 +230,41 @@ reset() {
     podman volume rm "$VOLUME_NAME"
   fi
   info "Removed container and volume. Run './setup.sh' to start fresh."
+}
+
+has_vpn_configs() {
+  compgen -G "${SCRIPT_DIR}/vpn-configs/*.conf" >/dev/null 2>&1
+}
+
+PROXY_PID_FILE="${SCRIPT_DIR}/.runtime/proxy-watch.pid"
+
+start_proxy_watch() {
+  if ! has_vpn_configs; then return; fi
+  if ! command -v bun >/dev/null 2>&1; then
+    warn "bun not found — skipping proxy routing. Install: brew install oven-sh/bun/bun"
+    return
+  fi
+
+  stop_proxy_watch 2>/dev/null
+
+  local logfile="${SCRIPT_DIR}/.runtime/proxy-watch.log"
+  mkdir -p "${SCRIPT_DIR}/.runtime"
+  info "Starting proxy watch (log: .runtime/proxy-watch.log)..."
+  nohup bun "${SCRIPT_DIR}/proxy-manager.ts" watch >> "$logfile" 2>&1 &
+  echo $! > "$PROXY_PID_FILE"
+}
+
+stop_proxy_watch() {
+  if [[ -f "$PROXY_PID_FILE" ]]; then
+    local pid
+    pid="$(cat "$PROXY_PID_FILE")"
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null || true
+      info "Proxy watch stopped."
+    fi
+    rm -f "$PROXY_PID_FILE"
+  fi
 }
 
 proxy() {
