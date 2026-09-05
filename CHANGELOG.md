@@ -1,10 +1,21 @@
 # Changelog
 
+## [0.3.0] — 2026-09-05
+
+Self-managing multi-exit proxy router.
+
+- **New:** `proxy-manager.ts` — TypeScript/Bun proxy orchestrator that routes SearXNG engine traffic through multiple VPN exits and Tor
+- **New:** `./setup.sh proxy` subcommand (start, stop, probe, status, watch)
+- **New:** Per-engine proxy routing via SearXNG `outgoing.networks`
+- **New:** Health matrix probing — tests every engine through every exit, picks optimal routes
+- **New:** Verification-driven re-routing with historical fallback from saved health data
+- **New:** Tunnel health monitoring — auto-restarts dead wireproxy instances individually
+- **New:** Watch mode — continuous 5-minute monitoring cycle (tunnel → engine → re-route)
+- **New:** Auto-enables disabled-by-default engines (bing, qwant, startpage, yahoo, etc.)
+- Update `.gitignore` to exclude `vpn-configs/` and `.runtime/` (contain private keys)
+- Update `settings.yml` template comments
+
 ## [Unreleased]
-
-### Changed
-
-- Tighten README tagline; align comment spacing in usage table
 
 ## [0.2.0] — 2026-09-04
 

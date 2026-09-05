@@ -227,6 +227,14 @@ reset() {
   info "Removed container and volume. Run './setup.sh' to start fresh."
 }
 
+proxy() {
+  local subcmd="${1:-start}"
+  if ! command -v bun >/dev/null 2>&1; then
+    error "bun not found. Install it: brew install oven-sh/bun/bun"
+  fi
+  exec bun "${SCRIPT_DIR}/proxy-manager.ts" "$subcmd"
+}
+
 usage() {
   cat <<EOF
 Usage: $(basename "$0") [command]
@@ -240,11 +248,19 @@ Commands:
   status    Show container status
   teardown  Remove the container (preserves settings volume)
   reset     Remove container AND settings volume (destructive)
+  proxy     Manage VPN proxy routing (start|stop|probe|status|watch)
   help      Show this message
 
 Environment:
   SEARXNG_PORT  Port to bind (default: 8080)
   SEARXNG_BIND  Address to bind (default: 127.0.0.1)
+
+Proxy routing:
+  Drop WireGuard .conf files into vpn-configs/ then run:
+    ./setup.sh proxy start   — start tunnels, probe engines, apply routes
+    ./setup.sh proxy watch   — continuous monitoring (foreground)
+    ./setup.sh proxy status  — show health matrix
+    ./setup.sh proxy stop    — stop VPN tunnels
 EOF
 }
 
@@ -257,6 +273,7 @@ case "${1:-setup}" in
   teardown) teardown ;;
   reset)    reset ;;
   status)   status ;;
+  proxy)    shift; proxy "$@" ;;
   help|-h|--help) usage ;;
   *) error "Unknown command: $1. Run '$(basename "$0") help' for usage." ;;
 esac

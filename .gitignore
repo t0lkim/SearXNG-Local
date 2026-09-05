@@ -2,3 +2,9 @@
 *.swp
 *.swo
 *~
+
+# WireGuard VPN configs contain private keys — never commit
+vpn-configs/
+
+# Runtime-generated wireproxy configs contain private keys
+.runtime/

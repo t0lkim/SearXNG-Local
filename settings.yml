@@ -12,16 +12,18 @@ server:
   secret_key: "GENERATED_AT_SETUP"
   image_proxy: true
 
-# Uncomment to restrict search engines:
-# engines:
-#   - name: google
-#     disabled: false
-#   - name: duckduckgo
-#     disabled: false
-#   - name: brave
-#     disabled: false
+search:
+  formats:
+    - html
+    - json
 
-# Uncomment to change the UI:
-# ui:
-#   default_theme: simple
-#   default_locale: en
+# Route all outgoing requests through a local Tor SOCKS5 proxy.
+# Requires Tor running on the host (brew install tor && brew services start tor).
+# The container reaches the host via host.containers.internal.
+outgoing:
+  proxies:
+    "all://":
+      - "socks5h://host.containers.internal:9050"
+  request_timeout: 10.0
+  max_request_timeout: 15.0
+  useragent_suffix: ""
