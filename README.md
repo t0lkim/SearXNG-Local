@@ -48,9 +48,13 @@ The proxy manager routes each search engine through the best available exit (VPN
 - [Tor](https://www.torproject.org/) running locally (`brew install tor && brew services start tor`)
 - One or more WireGuard `.conf` files (e.g. from ProtonVPN) dropped into `vpn-configs/`
 
+When `vpn-configs/` contains `.conf` files, `./setup.sh` automatically starts the proxy watch in the background alongside the container. `./setup.sh stop` stops both. Log output goes to `.runtime/proxy-watch.log`.
+
+For manual control:
+
 ```bash
 ./setup.sh proxy start   # Start tunnels, probe engines, apply optimal routes
-./setup.sh proxy watch   # Continuous monitoring (re-probes every 5 min)
+./setup.sh proxy watch   # Continuous monitoring (foreground, re-probes every 5 min)
 ./setup.sh proxy status  # Show current health matrix
 ./setup.sh proxy probe   # Run a one-off health probe
 ./setup.sh proxy stop    # Stop VPN tunnels

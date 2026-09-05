@@ -12,8 +12,11 @@ Self-managing multi-exit proxy router.
 - **New:** Tunnel health monitoring — auto-restarts dead wireproxy instances individually
 - **New:** Watch mode — continuous 5-minute monitoring cycle (tunnel → engine → re-route)
 - **New:** Auto-enables disabled-by-default engines (bing, qwant, startpage, yahoo, etc.)
+- **New:** Auto-start proxy watch on container startup when `vpn-configs/` has configs
+- `stop`, `teardown`, and `reset` now stop the proxy watch and wireproxy tunnels
 - Update `.gitignore` to exclude `vpn-configs/` and `.runtime/` (contain private keys)
 - Update `settings.yml` template comments
+- Update README with proxy routing documentation
 
 ## [Unreleased]
 
