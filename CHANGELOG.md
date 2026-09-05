@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.0] — 2026-09-05
+
+Parallel probing, country labels, instant startup.
+
+- **New:** Parallel exit probing — all exits probed concurrently via direct curl (was sequential through SearXNG)
+- **New:** Country column in tunnel dashboard and JSON API (ISO 3166-1 alpha-2 → full name)
+- Reverse proxy starts immediately on launch; probing runs in background
+- Startup time reduced from ~3 minutes to ~15 seconds for the probe phase
+
 ## [0.4.0] — 2026-09-05
 
 Reverse proxy architecture, status dashboard, and Tor circuit rotation.

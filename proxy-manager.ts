@@ -22,6 +22,20 @@ const TOR_CONTROL_PORT = 9051;
 const TOR_CONTROL_PASS = "searxng-local";
 const TOR_RETRY_MAX = 5;
 
+const COUNTRY_NAMES: Record<string, string> = {
+  AT: "Austria", AU: "Australia", BE: "Belgium", BG: "Bulgaria", BR: "Brazil",
+  CA: "Canada", CH: "Switzerland", CZ: "Czechia", DE: "Germany", DK: "Denmark",
+  EE: "Estonia", ES: "Spain", FI: "Finland", FR: "France", GB: "United Kingdom",
+  GR: "Greece", HK: "Hong Kong", HR: "Croatia", HU: "Hungary", ID: "Indonesia",
+  IE: "Ireland", IL: "Israel", IN: "India", IS: "Iceland", IT: "Italy",
+  JP: "Japan", KR: "South Korea", LT: "Lithuania", LU: "Luxembourg",
+  LV: "Latvia", MY: "Malaysia", MX: "Mexico", NL: "Netherlands", NO: "Norway",
+  NZ: "New Zealand", PH: "Philippines", PL: "Poland", PT: "Portugal",
+  RO: "Romania", RS: "Serbia", SE: "Sweden", SG: "Singapore", SK: "Slovakia",
+  TH: "Thailand", TR: "Turkey", TW: "Taiwan", UA: "Ukraine", US: "United States",
+  VN: "Vietnam", ZA: "South Africa",
+};
+
 // Engines disabled by default in SearXNG that we want enabled
 const ENABLE_ENGINES = [
   "bing", "boardreader", "crowdview", "gmx", "mojeek", "mwmbl",
@@ -438,12 +452,63 @@ async function probeExit(exit: Exit, secretKey: string): Promise<ExitProbe> {
   }
 }
 
-async function fullProbe(exits: Exit[], secretKey: string): Promise<ExitProbe[]> {
-  const probes: ExitProbe[] = [];
-  for (const exit of exits) {
-    probes.push(await probeExit(exit, secretKey));
+const ENGINE_URLS: [string, string][] = [
+  ["bing", "https://www.bing.com/search?q=test"],
+  ["brave", "https://search.brave.com/search?q=test"],
+  ["crowdview", "https://www.crowdview.ai/?q=test"],
+  ["duckduckgo", "https://html.duckduckgo.com/html/?q=test"],
+  ["gmx", "https://search.gmx.net/web?q=test"],
+  ["google", "https://www.google.com/search?q=test"],
+  ["mojeek", "https://www.mojeek.com/search?q=test"],
+  ["mwmbl", "https://mwmbl.org/?q=test"],
+  ["qwant", "https://www.qwant.com/?q=test"],
+  ["startpage", "https://www.startpage.com/sp/search?query=test"],
+  ["wiby", "https://wiby.me/?q=test"],
+  ["yahoo", "https://search.yahoo.com/search?p=test"],
+  ["yep", "https://yep.com/web?q=test"],
+];
+
+async function directProbeEngine(
+  engine: string, url: string, socksPort: number,
+): Promise<EngineResult> {
+  try {
+    const proc = Bun.spawn(
+      ["curl", "-s", "-o", "-", "-w", "\n%{http_code}",
+       "--proxy", `socks5h://127.0.0.1:${socksPort}`,
+       "--max-time", "12", "-A", "Mozilla/5.0", url],
+      { stdout: "pipe", stderr: "ignore" },
+    );
+    const out = await new Response(proc.stdout).text();
+    const lines = out.trimEnd().split("\n");
+    const code = parseInt(lines[lines.length - 1], 10);
+    const body = lines.slice(0, -1).join("\n").toLowerCase();
+
+    if (code === 0 || isNaN(code)) return { engine, status: "timeout" };
+    if (code === 403 || code === 429 || code === 503)
+      return { engine, status: "blocked", detail: `HTTP ${code}` };
+    if (code >= 200 && code < 400) {
+      if (body.includes("captcha") || body.includes("recaptcha") || body.includes("hcaptcha"))
+        return { engine, status: "captcha", detail: "CAPTCHA detected" };
+      return { engine, status: "ok" };
+    }
+    return { engine, status: "error", detail: `HTTP ${code}` };
+  } catch {
+    return { engine, status: "timeout" };
   }
-  return probes;
+}
+
+async function directProbeExit(exit: Exit): Promise<ExitProbe> {
+  const results = await Promise.all(
+    ENGINE_URLS.map(([eng, url]) => directProbeEngine(eng, url, exit.port)),
+  );
+  const ok = results.filter(r => r.status === "ok").length;
+  const bad = results.length - ok;
+  console.log(`  probed ${exit.name}: ${ok} ok, ${bad} blocked`);
+  return { exit: exit.name, engines: results };
+}
+
+async function fullProbe(exits: Exit[], _secretKey: string): Promise<ExitProbe[]> {
+  return Promise.all(exits.map(exit => directProbeExit(exit)));
 }
 
 // ─── Route optimisation ─────────────────────────────────────
@@ -695,8 +760,8 @@ async function cmdStatus() {
 
 async function cmdWatch() {
   console.log("Starting proxy manager in watch mode...\n");
-  await cmdStart();
   startStatusServer();
+  await cmdStart();
 
   const allExits = await discoverExits();
   console.log(`Monitoring every ${MONITOR_INTERVAL / 1000}s... (Ctrl-C to stop)\n`);
@@ -808,7 +873,7 @@ async function statusJson(): Promise<Response> {
     matrix = JSON.parse(await readFile(HEALTH_FILE, "utf-8"));
   } catch { /* no matrix yet */ }
 
-  const tunnels: { name: string; port: number; alive: boolean }[] = [];
+  const tunnels: { name: string; country: string; port: number; alive: boolean }[] = [];
   const exits = await discoverExits();
   for (const exit of exits) {
     let alive = false;
@@ -816,7 +881,8 @@ async function statusJson(): Promise<Response> {
       execSync(`nc -z -G 2 127.0.0.1 ${exit.port}`, { stdio: "ignore", timeout: 3000 });
       alive = true;
     } catch { /* dead */ }
-    tunnels.push({ name: exit.name, port: exit.port, alive });
+    const country = exit.country ? (COUNTRY_NAMES[exit.country] ?? exit.country) : (exit.type === "tor" ? "Tor network" : "—");
+    tunnels.push({ name: exit.name, country, port: exit.port, alive });
   }
 
   return Response.json({ matrix, tunnels }, {
@@ -830,7 +896,7 @@ async function statusPage(): Promise<Response> {
     matrix = JSON.parse(await readFile(HEALTH_FILE, "utf-8"));
   } catch { /* no matrix yet */ }
 
-  const tunnels: { name: string; port: number; alive: boolean }[] = [];
+  const tunnels: { name: string; country: string; port: number; alive: boolean }[] = [];
   const exits = await discoverExits();
   for (const exit of exits) {
     let alive = false;
@@ -838,7 +904,8 @@ async function statusPage(): Promise<Response> {
       execSync(`nc -z -G 2 127.0.0.1 ${exit.port}`, { stdio: "ignore", timeout: 3000 });
       alive = true;
     } catch { /* dead */ }
-    tunnels.push({ name: exit.name, port: exit.port, alive });
+    const country = exit.country ? (COUNTRY_NAMES[exit.country] ?? exit.country) : (exit.type === "tor" ? "Tor network" : "—");
+    tunnels.push({ name: exit.name, country, port: exit.port, alive });
   }
 
   const defaultExit = matrix?.assignments._default ?? "unknown";
@@ -927,9 +994,9 @@ async function statusPage(): Promise<Response> {
   <div class="card">
     <h2>Tunnels</h2>
     <table>
-      <tr><th>Exit</th><th>Port</th><th>Status</th></tr>
+      <tr><th>Exit</th><th>Country</th><th>Port</th><th>Status</th></tr>
       ${tunnels.map(t =>
-        `<tr><td><span class="dot ${t.alive ? "alive" : "dead"}"></span>${t.name}</td><td>${t.port}</td><td class="${t.alive ? "ok" : "bad"}">${t.alive ? "alive" : "dead"}</td></tr>`
+        `<tr><td><span class="dot ${t.alive ? "alive" : "dead"}"></span>${t.name}</td><td class="muted">${t.country}</td><td>${t.port}</td><td class="${t.alive ? "ok" : "bad"}">${t.alive ? "alive" : "dead"}</td></tr>`
       ).join("\n      ")}
     </table>
   </div>
