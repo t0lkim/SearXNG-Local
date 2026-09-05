@@ -7,10 +7,10 @@ set -euo pipefail
 CONTAINER_NAME="searxng"
 VOLUME_NAME="searxng-data"
 IMAGE="docker.io/searxng/searxng:latest"
-PORT="${SEARXNG_PORT:-8080}"
+INTERNAL_PORT="${SEARXNG_INTERNAL_PORT:-8082}"
 BIND="${SEARXNG_BIND:-127.0.0.1}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BASE_URL="http://localhost:${PORT}/"
+BASE_URL="http://localhost:8080/"
 
 info() {
   printf '\033[1;34m==>\033[0m %s\n' "$*"
@@ -26,9 +26,9 @@ error() {
 }
 
 validate_port() {
-  [[ "$PORT" =~ ^[0-9]+$ ]] || error "SEARXNG_PORT must be a number, got: '${PORT}'"
-  if (( PORT < 1 || PORT > 65535 )); then
-    error "SEARXNG_PORT must be between 1 and 65535, got: ${PORT}"
+  [[ "$INTERNAL_PORT" =~ ^[0-9]+$ ]] || error "SEARXNG_INTERNAL_PORT must be a number, got: '${INTERNAL_PORT}'"
+  if (( INTERNAL_PORT < 1 || INTERNAL_PORT > 65535 )); then
+    error "SEARXNG_INTERNAL_PORT must be between 1 and 65535, got: ${INTERNAL_PORT}"
   fi
 }
 
@@ -130,7 +130,7 @@ setup() {
   podman run -d \
     --name "$CONTAINER_NAME" \
     --restart always \
-    -p "${BIND}:${PORT}:8080" \
+    -p "${BIND}:${INTERNAL_PORT}:8080" \
     -v "${VOLUME_NAME}:/etc/searxng" \
     -e "SEARXNG_BASE_URL=${BASE_URL}" \
     "$IMAGE"
@@ -197,7 +197,7 @@ update() {
   podman run -d \
     --name "$CONTAINER_NAME" \
     --restart always \
-    -p "${BIND}:${PORT}:8080" \
+    -p "${BIND}:${INTERNAL_PORT}:8080" \
     -v "${VOLUME_NAME}:/etc/searxng" \
     -e "SEARXNG_BASE_URL=${BASE_URL}" \
     "$IMAGE"
@@ -292,8 +292,8 @@ Commands:
   help      Show this message
 
 Environment:
-  SEARXNG_PORT  Port to bind (default: 8080)
-  SEARXNG_BIND  Address to bind (default: 127.0.0.1)
+  SEARXNG_INTERNAL_PORT  Internal SearXNG port (default: 8082)
+  SEARXNG_BIND           Address to bind (default: 127.0.0.1)
 
 Proxy routing:
   Drop WireGuard .conf files into vpn-configs/ then run:

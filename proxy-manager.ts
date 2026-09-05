@@ -8,7 +8,8 @@ const ROOT = import.meta.dir;
 const VPN_DIR = join(ROOT, "vpn-configs");
 const RUNTIME_DIR = join(ROOT, ".runtime");
 const HEALTH_FILE = join(RUNTIME_DIR, "health-matrix.json");
-const SEARXNG_URL = "http://localhost:8080";
+const SEARXNG_INTERNAL_PORT = 8082;
+const SEARXNG_URL = `http://localhost:${SEARXNG_INTERNAL_PORT}`;
 const CONTAINER_NAME = "searxng";
 const TOR_PORT = 9050;
 const WP_BASE_PORT = 10801;
@@ -16,6 +17,10 @@ const WP_BIN = join(process.env.HOME!, "go", "bin", "wireproxy");
 const PROBE_TIMEOUT = 15_000;
 const READY_TIMEOUT = 20_000;
 const MONITOR_INTERVAL = 300_000;
+const PROXY_PORT = 8080;
+const TOR_CONTROL_PORT = 9051;
+const TOR_CONTROL_PASS = "searxng-local";
+const TOR_RETRY_MAX = 5;
 
 // Engines disabled by default in SearXNG that we want enabled
 const ENABLE_ENGINES = [
@@ -50,6 +55,61 @@ interface HealthMatrix {
 
 const processes = new Map<string, Subprocess>();
 type Subprocess = ReturnType<typeof Bun.spawn>;
+
+// ─── Tor circuit rotation ──────────────────────────────────
+
+async function rotateTorCircuit(): Promise<boolean> {
+  try {
+    const socket = await Bun.connect({
+      hostname: "127.0.0.1",
+      port: TOR_CONTROL_PORT,
+      socket: {
+        data(_, data) { socket.data += data.toString(); },
+        open(socket) { socket.data = ""; },
+        error() {},
+        close() {},
+      },
+    });
+    // Small delay for the banner
+    await Bun.sleep(200);
+
+    socket.write(`AUTHENTICATE "${TOR_CONTROL_PASS}"\r\n`);
+    await Bun.sleep(200);
+
+    socket.write("SIGNAL NEWNYM\r\n");
+    await Bun.sleep(200);
+
+    const response = socket.data as string;
+    socket.end();
+
+    return response.includes("250 OK");
+  } catch {
+    return false;
+  }
+}
+
+async function rotateTorUntilQwantWorks(secretKey: string): Promise<string | null> {
+  const torExit: Exit = { name: "tor", type: "tor", port: TOR_PORT };
+
+  for (let attempt = 1; attempt <= TOR_RETRY_MAX; attempt++) {
+    console.log(`  Tor circuit rotation attempt ${attempt}/${TOR_RETRY_MAX}...`);
+    if (!await rotateTorCircuit()) {
+      console.log("    ✗ circuit rotation failed (control port)");
+      continue;
+    }
+    // Wait for new circuit to establish
+    await Bun.sleep(3000);
+
+    const probe = await probeExit(torExit, secretKey);
+    const qwant = probe.engines.find(e => e.engine === "qwant");
+    if (qwant?.status === "ok") {
+      console.log(`    ✓ qwant works on new Tor circuit`);
+      return "tor";
+    }
+    console.log(`    ✗ qwant still ${qwant?.status ?? "missing"}`);
+  }
+  return null;
+}
 
 // ─── WireGuard → wireproxy config ───────────────────────────
 
@@ -508,6 +568,15 @@ async function cmdStart() {
         console.log(`    ✗ ${name}: ${reason} → re-routing to ${alt}`);
         assignments[name] = alt;
         rerouted = true;
+      } else if (reason.toLowerCase().includes("captcha")) {
+        console.log(`    ✗ ${name}: ${reason} → trying Tor circuit rotation`);
+        const torAlt = await rotateTorUntilQwantWorks(secretKey);
+        if (torAlt) {
+          assignments[name] = torAlt;
+          rerouted = true;
+        } else {
+          console.log(`    ✗ ${name}: exhausted ${TOR_RETRY_MAX} circuit rotations`);
+        }
       } else {
         console.log(`    ✗ ${name}: ${reason} (no alternative)`);
       }
@@ -627,9 +696,10 @@ async function cmdStatus() {
 async function cmdWatch() {
   console.log("Starting proxy manager in watch mode...\n");
   await cmdStart();
+  startStatusServer();
 
   const allExits = await discoverExits();
-  console.log(`\nMonitoring every ${MONITOR_INTERVAL / 1000}s... (Ctrl-C to stop)\n`);
+  console.log(`Monitoring every ${MONITOR_INTERVAL / 1000}s... (Ctrl-C to stop)\n`);
 
   while (true) {
     await Bun.sleep(MONITOR_INTERVAL);
@@ -669,6 +739,243 @@ async function cmdWatch() {
       await cmdProbe();
     }
   }
+}
+
+// ─── Status dashboard ──────────────────────────────────────
+
+function startStatusServer() {
+  Bun.serve({
+    port: PROXY_PORT,
+    hostname: "127.0.0.1",
+    async fetch(req) {
+      const url = new URL(req.url);
+
+      if (url.pathname === "/stats" || url.pathname === "/stats/") {
+        return statusPage();
+      }
+      if (url.pathname === "/api/status") {
+        return statusJson();
+      }
+      if (url.pathname === "/api/log") {
+        return statusLog(url);
+      }
+
+      // Reverse-proxy everything else to SearXNG
+      const target = `${SEARXNG_URL}${url.pathname}${url.search}`;
+      try {
+        const upstream = await fetch(target, {
+          method: req.method,
+          headers: req.headers,
+          body: req.method !== "GET" && req.method !== "HEAD" ? req.body : undefined,
+          redirect: "manual",
+          signal: AbortSignal.timeout(30_000),
+        });
+        return new Response(upstream.body, {
+          status: upstream.status,
+          statusText: upstream.statusText,
+          headers: upstream.headers,
+        });
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return new Response(`SearXNG unavailable: ${msg}\n`, { status: 502 });
+      }
+    },
+  });
+  console.log(`Proxy listening on http://localhost:${PROXY_PORT}/ (SearXNG on :${SEARXNG_INTERNAL_PORT}, /stats → dashboard)\n`);
+}
+
+const LOG_FILE = join(RUNTIME_DIR, "proxy-watch.log");
+
+async function statusLog(url: URL): Promise<Response> {
+  const lines = parseInt(url.searchParams.get("lines") ?? "50", 10);
+  try {
+    const content = await readFile(LOG_FILE, "utf-8");
+    const allLines = content.split("\n");
+    const tail = allLines.slice(-Math.min(lines, 200)).join("\n");
+    return new Response(tail, {
+      headers: { "Content-Type": "text/plain; charset=utf-8", "Access-Control-Allow-Origin": "*" },
+    });
+  } catch {
+    return new Response("No log file yet.\n", {
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
+  }
+}
+
+async function statusJson(): Promise<Response> {
+  let matrix: HealthMatrix | null = null;
+  try {
+    matrix = JSON.parse(await readFile(HEALTH_FILE, "utf-8"));
+  } catch { /* no matrix yet */ }
+
+  const tunnels: { name: string; port: number; alive: boolean }[] = [];
+  const exits = await discoverExits();
+  for (const exit of exits) {
+    let alive = false;
+    try {
+      execSync(`nc -z -G 2 127.0.0.1 ${exit.port}`, { stdio: "ignore", timeout: 3000 });
+      alive = true;
+    } catch { /* dead */ }
+    tunnels.push({ name: exit.name, port: exit.port, alive });
+  }
+
+  return Response.json({ matrix, tunnels }, {
+    headers: { "Access-Control-Allow-Origin": "*" },
+  });
+}
+
+async function statusPage(): Promise<Response> {
+  let matrix: HealthMatrix | null = null;
+  try {
+    matrix = JSON.parse(await readFile(HEALTH_FILE, "utf-8"));
+  } catch { /* no matrix yet */ }
+
+  const tunnels: { name: string; port: number; alive: boolean }[] = [];
+  const exits = await discoverExits();
+  for (const exit of exits) {
+    let alive = false;
+    try {
+      execSync(`nc -z -G 2 127.0.0.1 ${exit.port}`, { stdio: "ignore", timeout: 3000 });
+      alive = true;
+    } catch { /* dead */ }
+    tunnels.push({ name: exit.name, port: exit.port, alive });
+  }
+
+  const defaultExit = matrix?.assignments._default ?? "unknown";
+  const assignments = matrix?.assignments ?? {};
+
+  // Build engine list with routes
+  const allEngines = new Set<string>();
+  if (matrix) {
+    for (const p of matrix.probes) for (const e of p.engines) allEngines.add(e.engine);
+  }
+  const engines = [...allEngines].sort();
+
+  // Build lookup for the health grid
+  const lookup = new Map<string, Map<string, EngineResult>>();
+  if (matrix) {
+    for (const probe of matrix.probes) {
+      const m = new Map<string, EngineResult>();
+      for (const e of probe.engines) m.set(e.engine, e);
+      lookup.set(probe.exit, m);
+    }
+  }
+  const exitNames = matrix?.probes.map(p => p.exit) ?? [];
+
+  const probeAge = matrix
+    ? Math.round((Date.now() - new Date(matrix.timestamp).getTime()) / 60_000)
+    : null;
+
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SearXNG Proxy Status</title>
+<style>
+  :root { --bg: #0d1117; --fg: #e6edf3; --card: #161b22; --border: #30363d; --ok: #3fb950; --bad: #f85149; --warn: #d29922; --muted: #8b949e; --accent: #58a6ff; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--fg); padding: 1.5rem; max-width: 1400px; margin: 0 auto; }
+  h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
+  .subtitle { color: var(--muted); font-size: 0.85rem; margin-bottom: 1.5rem; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 1.5rem; }
+  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; }
+  .card h2 { font-size: 1rem; margin-bottom: 0.75rem; color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th, td { padding: 0.35rem 0.6rem; text-align: left; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; }
+  .ok { color: var(--ok); }
+  .bad { color: var(--bad); }
+  .warn { color: var(--warn); }
+  .muted { color: var(--muted); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot.alive { background: var(--ok); }
+  .dot.dead { background: var(--bad); }
+  .tag { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.75rem; font-weight: 500; }
+  .tag.default { background: rgba(88,166,255,0.15); color: var(--accent); }
+  .tag.routed { background: rgba(63,185,80,0.15); color: var(--ok); }
+  .tag.blocked { background: rgba(248,81,73,0.15); color: var(--bad); }
+  .health-grid { overflow-x: auto; }
+  .health-grid table { min-width: 600px; }
+  .health-grid td, .health-grid th { text-align: center; padding: 0.3rem 0.4rem; font-size: 0.78rem; white-space: nowrap; }
+  .health-grid td:first-child, .health-grid th:first-child { text-align: left; }
+  .refresh { float: right; color: var(--muted); font-size: 0.8rem; cursor: pointer; text-decoration: underline; }
+</style>
+</head>
+<body>
+<h1>SearXNG Proxy Status</h1>
+<p class="subtitle">Last probe: ${probeAge !== null ? `${probeAge}m ago` : "never"} &bull; Default exit: <strong>${defaultExit}</strong> <a class="refresh" onclick="location.reload()">refresh</a></p>
+
+<div class="grid">
+  <div class="card">
+    <h2>Engine Routing</h2>
+    <table>
+      <tr><th>Engine</th><th>Exit</th><th>Status</th></tr>
+      ${engines.map(eng => {
+        const route = assignments[eng] ?? defaultExit;
+        const isCustom = eng in assignments && eng !== "_default";
+        const probe = lookup.get(route)?.get(eng);
+        const status = probe?.status ?? "unknown";
+        const statusClass = status === "ok" ? "ok" : status === "timeout" ? "warn" : status === "unknown" ? "muted" : "bad";
+        const tagClass = isCustom ? "routed" : "default";
+        return `<tr><td>${eng}</td><td><span class="tag ${tagClass}">${route}</span></td><td class="${statusClass}">${status}</td></tr>`;
+      }).join("\n      ")}
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Tunnels</h2>
+    <table>
+      <tr><th>Exit</th><th>Port</th><th>Status</th></tr>
+      ${tunnels.map(t =>
+        `<tr><td><span class="dot ${t.alive ? "alive" : "dead"}"></span>${t.name}</td><td>${t.port}</td><td class="${t.alive ? "ok" : "bad"}">${t.alive ? "alive" : "dead"}</td></tr>`
+      ).join("\n      ")}
+    </table>
+  </div>
+</div>
+
+<div class="card health-grid">
+  <h2>Health Matrix</h2>
+  <table>
+    <tr><th>Engine</th>${exitNames.map(e => `<th>${e}</th>`).join("")}</tr>
+    ${engines.map(eng => {
+      const cells = exitNames.map(ex => {
+        const er = lookup.get(ex)?.get(eng);
+        if (!er) return `<td class="muted">—</td>`;
+        if (er.status === "ok") return `<td class="ok">✓</td>`;
+        return `<td class="bad" title="${er.detail ?? er.status}">✗</td>`;
+      }).join("");
+      return `<tr><td>${eng}</td>${cells}</tr>`;
+    }).join("\n    ")}
+  </table>
+</div>
+
+<div class="card" style="margin-top: 1.5rem;">
+  <h2>Activity Log</h2>
+  <pre id="log" style="background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.75rem; font-size: 0.78rem; line-height: 1.5; max-height: 400px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; color: var(--fg);"></pre>
+</div>
+
+<script>
+async function refreshLog() {
+  try {
+    const res = await fetch("/api/log?lines=80");
+    const text = await res.text();
+    const el = document.getElementById("log");
+    el.textContent = text;
+    el.scrollTop = el.scrollHeight;
+  } catch {}
+}
+refreshLog();
+setInterval(refreshLog, 10000);
+setTimeout(() => location.reload(), 120000);
+</script>
+</body>
+</html>`;
+
+  return new Response(html, {
+    headers: { "Content-Type": "text/html; charset=utf-8" },
+  });
 }
 
 function usage() {

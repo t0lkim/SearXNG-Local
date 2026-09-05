@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.0] — 2026-09-05
+
+Reverse proxy architecture, status dashboard, and Tor circuit rotation.
+
+- **New:** Reverse proxy — Bun server on :8080 as front door, SearXNG internal on :8082
+- **New:** Status dashboard at `/stats` — engine routing, tunnel health, health matrix, activity log
+- **New:** JSON API endpoints `/api/status` and `/api/log`
+- **New:** Tor circuit rotation via control port — rotates circuits when qwant is CAPTCHAd
+- **New:** CAPTCHA-aware re-routing in the verification pass
+- SearXNG `/stats` replaced by our dashboard (more comprehensive, same info plus routing)
+- Dashboard auto-refreshes every 120s, log panel polls every 10s
+
 ## [0.3.0] — 2026-09-05
 
 Self-managing multi-exit proxy router.
@@ -16,14 +28,6 @@ Self-managing multi-exit proxy router.
 - `stop`, `teardown`, and `reset` now stop the proxy watch and wireproxy tunnels
 - Update `.gitignore` to exclude `vpn-configs/` and `.runtime/` (contain private keys)
 - Update `settings.yml` template comments
-- Update README with proxy routing documentation
-
-## [Unreleased]
-
-### Changed
-
-- Proxy watch starts automatically with the container when `vpn-configs/` has configs
-- `stop`, `teardown`, and `reset` now stop the proxy watch and wireproxy tunnels
 - Update README with proxy routing documentation
 
 ## [0.2.0] — 2026-09-04

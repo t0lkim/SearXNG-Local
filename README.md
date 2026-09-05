@@ -85,10 +85,13 @@ The health matrix is saved to `.runtime/health-matrix.json` and used as a histor
 ./setup.sh help          # Show all commands
 ```
 
-### Custom port or bind address
+### Status dashboard
+
+When proxy routing is active, visit [http://localhost:8080/stats](http://localhost:8080/stats) for a live dashboard showing engine routing, tunnel health, and the health matrix.
+
+### Custom bind address
 
 ```bash
-SEARXNG_PORT=9090 ./setup.sh
 SEARXNG_BIND=0.0.0.0 ./setup.sh   # Expose to the network (default: 127.0.0.1)
 ```
 
