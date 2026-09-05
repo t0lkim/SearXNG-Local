@@ -63,13 +63,13 @@ For manual control:
 ### How it works
 
 1. Spawns a wireproxy SOCKS5 instance for each `.conf` file in `vpn-configs/`
-2. Probes every enabled engine through every exit (Tor + all VPNs)
+2. Probes every enabled engine through every exit concurrently (all exits in parallel, ~15 seconds total)
 3. Picks the exit that serves the most engines as the default
 4. Routes engines that are blocked on the default to an exit where they work
 5. Applies a verification search and re-routes any engine that still fails
 6. In watch mode, checks tunnel health and engine availability every 5 minutes
 
-The health matrix is saved to `.runtime/health-matrix.json` and used as a historical fallback when a current probe shows no alternative for a blocked engine.
+The reverse proxy starts immediately — search is available while the first probe cycle runs in the background. The health matrix is saved to `.runtime/health-matrix.json` and used as a historical fallback when a current probe shows no alternative for a blocked engine.
 
 ## Usage
 
@@ -87,7 +87,7 @@ The health matrix is saved to `.runtime/health-matrix.json` and used as a histor
 
 ### Status dashboard
 
-When proxy routing is active, visit [http://localhost:8080/stats](http://localhost:8080/stats) for a live dashboard showing engine routing, tunnel health, and the health matrix.
+When proxy routing is active, visit [http://localhost:8080/stats](http://localhost:8080/stats) for a live dashboard showing engine routing, tunnel health (with country labels), and the full health matrix. JSON endpoints are available at `/api/status` and `/api/log`.
 
 ### Custom bind address
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.5.1] — 2026-09-05
+
+- Update README to document parallel probing, instant startup, country labels, and JSON API endpoints
+
 ## [0.5.0] — 2026-09-05
 
 Parallel probing, country labels, instant startup.
