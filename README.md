@@ -1,8 +1,8 @@
 # searxng-local
 
-Run [SearXNG](https://searxng.org) locally in a Podman container with persistent configuration.
+Run [SearXNG](https://searxng.org) locally in a Podman container with self-managing proxy routing across multiple VPN exits and Tor.
 
-SearXNG is a privacy-respecting metasearch engine that aggregates results from 70+ search engines without tracking you.
+SearXNG is a privacy-respecting metasearch engine that aggregates results from 70+ search engines without tracking you. Many engines block requests from known VPN and Tor IP ranges. The bundled proxy manager automatically routes each engine through whichever exit isn't blocking it, monitors for changes, and re-routes on the fly.
 
 ## Prerequisites
 
@@ -39,6 +39,34 @@ chmod +x setup.sh
 
 SearXNG is now running at [http://localhost:8080](http://localhost:8080).
 
+## Proxy routing
+
+The proxy manager routes each search engine through the best available exit (VPN or Tor), avoiding IP-based blocking. It requires:
+
+- [Bun](https://bun.sh) runtime
+- [wireproxy](https://github.com/pufferffish/wireproxy) (`go install github.com/pufferffish/wireproxy/cmd/wireproxy@latest`)
+- [Tor](https://www.torproject.org/) running locally (`brew install tor && brew services start tor`)
+- One or more WireGuard `.conf` files (e.g. from ProtonVPN) dropped into `vpn-configs/`
+
+```bash
+./setup.sh proxy start   # Start tunnels, probe engines, apply optimal routes
+./setup.sh proxy watch   # Continuous monitoring (re-probes every 5 min)
+./setup.sh proxy status  # Show current health matrix
+./setup.sh proxy probe   # Run a one-off health probe
+./setup.sh proxy stop    # Stop VPN tunnels
+```
+
+### How it works
+
+1. Spawns a wireproxy SOCKS5 instance for each `.conf` file in `vpn-configs/`
+2. Probes every enabled engine through every exit (Tor + all VPNs)
+3. Picks the exit that serves the most engines as the default
+4. Routes engines that are blocked on the default to an exit where they work
+5. Applies a verification search and re-routes any engine that still fails
+6. In watch mode, checks tunnel health and engine availability every 5 minutes
+
+The health matrix is saved to `.runtime/health-matrix.json` and used as a historical fallback when a current probe shows no alternative for a blocked engine.
+
 ## Usage
 
 ```bash
@@ -47,6 +75,7 @@ SearXNG is now running at [http://localhost:8080](http://localhost:8080).
 ./setup.sh update        # Pull latest image and recreate (preserves settings)
 ./setup.sh logs          # Show container logs
 ./setup.sh status        # Show container status
+./setup.sh proxy [cmd]   # Manage VPN/Tor proxy routing (see above)
 ./setup.sh teardown      # Remove container (preserves settings volume)
 ./setup.sh reset         # Remove container AND settings (destructive)
 ./setup.sh help          # Show all commands

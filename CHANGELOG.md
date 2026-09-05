@@ -17,6 +17,10 @@ Self-managing multi-exit proxy router.
 
 ## [Unreleased]
 
+### Changed
+
+- Update README with proxy routing documentation
+
 ## [0.2.0] — 2026-09-04
 
 Red team hardening, new commands, and test-driven fixes.
