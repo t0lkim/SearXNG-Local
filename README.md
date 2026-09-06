@@ -1,6 +1,6 @@
 # SearXNG-Local
 
-Run [SearXNG](https://searxng.org) locally using Apple's native [container](https://github.com/apple/container) runtime (macOS) or [Podman](https://podman.io) (GNU/Linux), with self-managing proxy routing across multiple VPN exits and Tor.
+Run [SearXNG](https://searxng.org) locally using Apple's native [container](https://github.com/apple/container) runtime (macOS) or [Podman](https://podman.io) (GNU/Linux), with a self-managing proxy router across multiple VPN exits and Tor.
 
 SearXNG is a privacy-respecting metasearch engine that aggregates results from 70+ search engines without tracking you. Many engines block requests from known VPN and Tor IP ranges. The bundled proxy manager automatically routes each engine through whichever exit isn't blocking it, monitors for changes, and re-routes on the fly.
 
@@ -24,7 +24,7 @@ container system kernel set --recommended
 # Debian/Ubuntu
 sudo apt install podman
 
-# Fedora/RHEL
+# Fedora/RHEL/CentOS
 sudo dnf install podman
 ```
 
@@ -39,7 +39,7 @@ chmod +x setup.sh
 
 SearXNG is now running at [http://localhost:8080](http://localhost:8080).
 
-The setup script auto-detects your container runtime (Apple container on macOS, Podman on Linux).
+The setup script auto-detects your container runtime (Apple container on macOS, Podman on GNU/Linux).
 
 ## Proxy routing
 
@@ -101,7 +101,7 @@ SEARXNG_BIND=0.0.0.0 ./setup.sh   # Expose to the network (default: 127.0.0.1)
 
 The setup script:
 
-1. Detects your container runtime (Apple container on macOS, Podman on Linux)
+1. Detects your container runtime (Apple container on macOS, Podman on GNU/Linux)
 2. Creates a named volume (`searxng-data`) for persistent configuration
 3. Generates a unique `secret_key` and writes `settings.yml` into the volume
 4. Pulls the official SearXNG image and starts the container
@@ -116,7 +116,7 @@ Settings persist in the `searxng-data` volume. To edit:
 # View current settings (macOS)
 container exec searxng cat /etc/searxng/settings.yml
 
-# View current settings (Linux)
+# View current settings (GNU/Linux)
 podman exec searxng cat /etc/searxng/settings.yml
 ```
 
@@ -199,7 +199,7 @@ Pulls the latest SearXNG image. If it's newer than what's running, the container
 ./setup.sh reset                       # Remove container + settings (interactive)
 container image delete searxng/searxng # macOS: remove image
 # or
-podman rmi docker.io/searxng/searxng   # Linux: remove image
+podman rmi docker.io/searxng/searxng   # GNU/Linux: remove image
 ```
 
 Or to keep your settings for later:

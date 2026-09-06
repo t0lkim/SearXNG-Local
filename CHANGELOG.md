@@ -5,6 +5,7 @@
 - **New:** Reprobe button on the dashboard — blocked/error/timeout engines get a one-click reprobe that tests all exits and re-routes if an alternative is found
 - **New:** `/api/reprobe?engine=<name>` POST endpoint for programmatic single-engine reprobing
 - Increase server idle timeout to 255s (prevents reprobe timeouts on slow exits)
+- Use GNU/Linux consistently in README (was bare "Linux" in places)
 
 ## [0.6.0] — 2026-09-06
 
