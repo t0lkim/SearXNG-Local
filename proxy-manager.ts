@@ -4,7 +4,7 @@ import { readdir, readFile, writeFile, mkdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
 
-const VERSION = "0.7.2";
+const VERSION = "0.7.3";
 const ROOT = import.meta.dir;
 const VPN_DIR = join(ROOT, "vpn-configs");
 const RUNTIME_DIR = join(ROOT, ".runtime");
@@ -510,8 +510,15 @@ async function directProbeEngine(
     if (code === 403 || code === 429 || code === 503)
       return { engine, status: "blocked", detail: `HTTP ${code}` };
     if (code >= 200 && code < 400) {
-      if (body.includes("captcha") || body.includes("recaptcha") || body.includes("hcaptcha"))
-        return { engine, status: "captcha", detail: "CAPTCHA detected" };
+      const isCaptcha =
+        body.includes("recaptcha") ||
+        body.includes("hcaptcha") ||
+        body.includes("g-recaptcha") ||
+        body.includes("cf-turnstile") ||
+        body.includes("please verify you are a human") ||
+        body.includes("unusual traffic") ||
+        (body.includes("captcha") && !body.includes("<title>"));
+      if (isCaptcha) return { engine, status: "captcha", detail: "CAPTCHA detected" };
       return { engine, status: "ok" };
     }
     return { engine, status: "error", detail: `HTTP ${code}` };

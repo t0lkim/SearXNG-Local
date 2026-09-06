@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.7.3] - 2026-09-06
+
+- Fix false CAPTCHA detection on Brave Search (i18n strings containing "captcha" triggered a false positive on valid results pages)
+- Tighten CAPTCHA detection to look for actual challenge indicators (reCAPTCHA, hCaptcha, Turnstile, "unusual traffic") rather than the bare word
+
 ## [0.7.2] - 2026-09-06
 
 - Show version number on dashboard
