@@ -1,6 +1,8 @@
 # SearXNG-Local
 I use this daily so I update it when I find bugs or add features. My current browser of choice for this is [Zen Browser](https://zen-browser.app/).
 
+---
+
 Run [SearXNG](https://searxng.org) locally using Apple's native [container](https://github.com/apple/container) runtime (macOS) or [Podman](https://podman.io) (GNU/Linux), with a self-managing proxy router across multiple VPN exits and Tor.
 
 SearXNG is a privacy-respecting metasearch engine that aggregates results from 70+ search engines without tracking you. Many engines block requests from known VPN and Tor IP ranges. The bundled proxy manager automatically routes each engine through whichever exit isn't blocking it, monitors for changes, and re-routes on the fly.
