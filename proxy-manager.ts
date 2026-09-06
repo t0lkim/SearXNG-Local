@@ -4,7 +4,7 @@ import { readdir, readFile, writeFile, mkdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
 
-const VERSION = "0.7.3";
+const VERSION = "0.7.4";
 const ROOT = import.meta.dir;
 const VPN_DIR = join(ROOT, "vpn-configs");
 const RUNTIME_DIR = join(ROOT, ".runtime");
@@ -498,7 +498,7 @@ async function directProbeEngine(
     const proc = Bun.spawn(
       ["curl", "-s", "-o", "-", "-w", "\n%{http_code}",
        "--proxy", `socks5h://127.0.0.1:${socksPort}`,
-       "--max-time", "12", "-A", "Mozilla/5.0", url],
+       "-L", "--max-time", "15", "-A", "Mozilla/5.0", url],
       { stdout: "pipe", stderr: "ignore" },
     );
     const out = await new Response(proc.stdout).text();
@@ -527,10 +527,14 @@ async function directProbeEngine(
   }
 }
 
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
 async function directProbeExit(exit: Exit): Promise<ExitProbe> {
-  const results = await Promise.all(
-    ENGINE_URLS.map(([eng, url]) => directProbeEngine(eng, url, exit.port)),
-  );
+  const results: EngineResult[] = [];
+  for (const [eng, url] of ENGINE_URLS) {
+    results.push(await directProbeEngine(eng, url, exit.port));
+    if (results.length < ENGINE_URLS.length) await sleep(500);
+  }
   const ok = results.filter(r => r.status === "ok").length;
   const bad = results.length - ok;
   console.log(`  probed ${exit.name}: ${ok} ok, ${bad} blocked`);

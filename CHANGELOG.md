@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.7.4] - 2026-09-06
+
+- Stagger engine probes per exit (500ms between each) to prevent tunnel saturation during parallel probing
+- Follow redirects in engine probes (fixes false timeouts on Google consent redirects through EU VPN exits)
+- Increase probe timeout from 12s to 15s
+
 ## [0.7.3] - 2026-09-06
 
 - Fix false CAPTCHA detection on Brave Search (i18n strings containing "captcha" triggered a false positive on valid results pages)
