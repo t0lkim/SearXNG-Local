@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.7.2] - 2026-09-06
+
+- Show active engine count in the dashboard subtitle line
+- Dashboard engine table now shows only engines with issues; "All engines routing OK" when healthy
+
 ## [0.7.1] - 2026-09-06
 
 - Dashboard engine table now shows only engines with issues (blocked/error/timeout/unknown); "All engines routing OK" when everything is healthy

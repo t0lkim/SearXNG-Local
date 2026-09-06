@@ -1035,6 +1035,10 @@ async function statusPage(): Promise<Response> {
     }
   }
   const exitNames = matrix?.probes.map(p => p.exit) ?? [];
+  const okCount = engines.filter(eng => {
+    const route = assignments[eng] ?? defaultExit;
+    return lookup.get(route)?.get(eng)?.status === "ok";
+  }).length;
 
   const probeAge = matrix
     ? Math.round((Date.now() - new Date(matrix.timestamp).getTime()) / 60_000)
@@ -1082,7 +1086,7 @@ async function statusPage(): Promise<Response> {
 </head>
 <body>
 <h1>SearXNG Proxy Status</h1>
-<p class="subtitle">Last probe: ${probeAge !== null ? `${probeAge}m ago` : "never"} &bull; Default exit: <strong>${defaultExit}</strong> <a class="refresh" onclick="location.reload()">refresh</a></p>
+<p class="subtitle">Last probe: ${probeAge !== null ? `${probeAge}m ago` : "never"} &bull; Default exit: <strong>${defaultExit}</strong> &bull; Active engines: <strong>${okCount}</strong> <a class="refresh" onclick="location.reload()">refresh</a></p>
 
 <div class="grid">
   <div class="card">
