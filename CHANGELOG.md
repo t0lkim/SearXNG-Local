@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.8.2] - 2026-09-06
+
+- Add `restart` command to setup.sh (stop + start in one step)
+- Remove `watch` references from README proxy section
+
 ## [0.8.1] - 2026-09-06
 
 CLI simplification, dead code removal, 403 rate-limit fix.

@@ -336,6 +336,11 @@ stop() {
   fi
 }
 
+restart() {
+  stop
+  setup
+}
+
 teardown() {
   detect_runtime
   stop_proxy_watch
@@ -478,6 +483,7 @@ Commands:
   setup     Create and start SearXNG (default)
   start     Start an existing container
   stop      Stop the container
+  restart   Stop and start everything
   update    Pull latest image and recreate container (preserves settings)
   logs      Show container logs (pass log flags after)
   status    Show container status
@@ -506,6 +512,7 @@ case "${1:-setup}" in
   setup)    setup ;;
   start)    setup ;;
   stop)     stop ;;
+  restart)  restart ;;
   update)   update ;;
   logs)     shift; logs "$@" ;;
   teardown) teardown ;;

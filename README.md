@@ -80,6 +80,7 @@ The reverse proxy starts immediately - search is available while the first probe
 ```bash
 ./setup.sh               # Create and start (or start if already created)
 ./setup.sh stop          # Stop the container
+./setup.sh restart       # Stop and start everything
 ./setup.sh update        # Pull latest image and recreate (preserves settings)
 ./setup.sh logs          # Show container logs
 ./setup.sh status        # Show container status
