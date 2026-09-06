@@ -22,6 +22,23 @@ const TOR_CONTROL_PORT = 9051;
 const TOR_CONTROL_PASS = "searxng-local";
 const TOR_RETRY_MAX = 5;
 
+function detectRuntime(): string {
+  if (process.platform === "darwin") {
+    try {
+      execSync("command -v container", { stdio: "ignore" });
+      return "container";
+    } catch { /* fall through */ }
+  }
+  try {
+    execSync("command -v podman", { stdio: "ignore" });
+    return "podman";
+  } catch {
+    throw new Error("No container runtime found (container or podman)");
+  }
+}
+
+const CONTAINER_RUNTIME = detectRuntime();
+
 const COUNTRY_NAMES: Record<string, string> = {
   AT: "Austria", AU: "Australia", BE: "Belgium", BG: "Bulgaria", BR: "Brazil",
   CA: "Canada", CH: "Switzerland", CZ: "Czechia", DE: "Germany", DK: "Denmark",
@@ -290,8 +307,9 @@ async function stopProxies(): Promise<void> {
 
 async function getSecretKey(): Promise<string> {
   try {
+    const execCmd = CONTAINER_RUNTIME === "container" ? "container exec" : "podman exec";
     const out = execSync(
-      `podman exec ${CONTAINER_NAME} grep secret_key /etc/searxng/settings.yml 2>/dev/null`,
+      `${execCmd} ${CONTAINER_NAME} grep secret_key /etc/searxng/settings.yml 2>/dev/null`,
       { encoding: "utf-8" },
     ).trim();
     const match = out.match(/secret_key:\s*"([^"]+)"/);
@@ -303,8 +321,12 @@ async function getSecretKey(): Promise<string> {
 async function applySettings(yaml: string): Promise<void> {
   const tmp = join(RUNTIME_DIR, "settings-live.yml");
   await writeFile(tmp, yaml);
-  execSync(`podman cp "${tmp}" ${CONTAINER_NAME}:/etc/searxng/settings.yml`);
-  execSync(`podman restart ${CONTAINER_NAME}`);
+  const cpCmd = CONTAINER_RUNTIME === "container" ? "container copy" : "podman cp";
+  execSync(`${cpCmd} "${tmp}" ${CONTAINER_NAME}:/etc/searxng/settings.yml`);
+  const restartCmd = CONTAINER_RUNTIME === "container"
+    ? `container stop ${CONTAINER_NAME} && container start ${CONTAINER_NAME}`
+    : `podman restart ${CONTAINER_NAME}`;
+  execSync(restartCmd, { stdio: "ignore" });
 }
 
 async function waitForReady(timeout = READY_TIMEOUT): Promise<boolean> {

@@ -7,6 +7,7 @@ Dual-runtime support: Apple container (macOS) + Podman (GNU/Linux).
 - **New:** Apple container runtime — native lightweight-VM containers on macOS (Tahoe), no Podman VM needed
 - **New:** Auto-detect runtime — uses Apple container on macOS, Podman on Linux
 - **New:** Runtime-agnostic helper layer — all container operations route through `rt_*` functions
+- Proxy manager detects runtime and uses the correct exec/cp/restart commands
 - Rename project to SearXNG-Local
 - Rewrite README for dual-runtime setup
 
