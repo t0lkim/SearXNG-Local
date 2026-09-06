@@ -8,7 +8,7 @@ SearXNG is a privacy-respecting metasearch engine that aggregates results from 7
 
 ### macOS (Apple Silicon)
 
-[Apple container](https://github.com/apple/container) — native lightweight-VM container runtime, requires macOS 26 (Tahoe):
+[Apple container](https://github.com/apple/container) - native lightweight-VM container runtime, requires macOS 26 (Tahoe):
 
 ```bash
 brew install container
@@ -71,7 +71,7 @@ For manual control:
 5. Applies a verification search and re-routes any engine that still fails
 6. In watch mode, checks tunnel health and engine availability every 5 minutes
 
-The reverse proxy starts immediately — search is available while the first probe cycle runs in the background. The health matrix is saved to `.runtime/health-matrix.json` and used as a historical fallback when a current probe shows no alternative for a blocked engine.
+The reverse proxy starts immediately - search is available while the first probe cycle runs in the background. The health matrix is saved to `.runtime/health-matrix.json` and used as a historical fallback when a current probe shows no alternative for a blocked engine.
 
 ## Usage
 
@@ -106,7 +106,7 @@ The setup script:
 3. Generates a unique `secret_key` and writes `settings.yml` into the volume
 4. Pulls the official SearXNG image and starts the container
 
-On subsequent runs it starts the existing container — no duplicate containers, no lost settings.
+On subsequent runs it starts the existing container - no duplicate containers, no lost settings.
 
 ## Configuration
 

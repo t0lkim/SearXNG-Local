@@ -437,7 +437,7 @@ PROXY_PID_FILE="${SCRIPT_DIR}/.runtime/proxy-watch.pid"
 start_proxy_watch() {
   if ! has_vpn_configs; then return; fi
   if ! command -v bun >/dev/null 2>&1; then
-    warn "bun not found — skipping proxy routing. Install: brew install oven-sh/bun/bun"
+    warn "bun not found - skipping proxy routing. Install: brew install oven-sh/bun/bun"
     return
   fi
 
@@ -497,10 +497,10 @@ Environment:
 
 Proxy routing:
   Drop WireGuard .conf files into vpn-configs/ then run:
-    ./setup.sh proxy start   — start tunnels, probe engines, apply routes
-    ./setup.sh proxy watch   — continuous monitoring (foreground)
-    ./setup.sh proxy status  — show health matrix
-    ./setup.sh proxy stop    — stop VPN tunnels
+    ./setup.sh proxy start   - start tunnels, probe engines, apply routes
+    ./setup.sh proxy watch   - continuous monitoring (foreground)
+    ./setup.sh proxy status  - show health matrix
+    ./setup.sh proxy stop    - stop VPN tunnels
 EOF
 }
 

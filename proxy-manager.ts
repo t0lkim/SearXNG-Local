@@ -270,7 +270,7 @@ async function restartDeadTunnels(exits: Exit[]): Promise<number> {
     try {
       execSync(`nc -z -G 2 127.0.0.1 ${exit.port}`, { stdio: "ignore", timeout: 3000 });
     } catch {
-      console.log(`  ⚠ ${exit.name} dead — restarting...`);
+      console.log(`  ⚠ ${exit.name} dead - restarting...`);
       const old = processes.get(exit.name);
       if (old) { try { old.kill(); } catch { /* already dead */ } }
       processes.delete(exit.name);
@@ -586,7 +586,7 @@ async function cmdStart() {
     execSync(`nc -z -G 2 127.0.0.1 ${TOR_PORT}`, { stdio: "ignore", timeout: 3000 });
     console.log(`  ✓ Tor SOCKS5 on port ${TOR_PORT}\n`);
   } catch {
-    console.log("  ⚠ Tor not running — start it: brew services start tor\n");
+    console.log("  ⚠ Tor not running - start it: brew services start tor\n");
   }
 
   // Start VPN tunnels
@@ -765,7 +765,7 @@ async function cmdStatus() {
     process.stdout.write(eng.padEnd(18));
     for (const ex of exitNames) {
       const er = lookup.get(ex)?.get(eng);
-      if (!er) process.stdout.write("—".padEnd(col));
+      if (!er) process.stdout.write("-".padEnd(col));
       else if (er.status === "ok") process.stdout.write("✓".padEnd(col));
       else process.stdout.write(`✗ ${er.status}`.substring(0, col - 2).padEnd(col));
     }
@@ -796,7 +796,7 @@ async function cmdWatch() {
     process.stdout.write(`[${ts}] tunnel check...`);
     const revived = await restartDeadTunnels(allExits);
     if (revived > 0) {
-      console.log(` ${revived} tunnel(s) restarted — re-probing`);
+      console.log(` ${revived} tunnel(s) restarted - re-probing`);
       await cmdProbe();
       continue;
     }
@@ -809,20 +809,20 @@ async function cmdWatch() {
         signal: AbortSignal.timeout(PROBE_TIMEOUT),
       });
       if (!res.ok) {
-        console.log(` ⚠ HTTP ${res.status} — re-probing`);
+        console.log(` ⚠ HTTP ${res.status} - re-probing`);
         await cmdProbe();
         continue;
       }
       const data = (await res.json()) as { unresponsive_engines?: [string, string][] };
       const bad = data.unresponsive_engines ?? [];
       if (bad.length > 0) {
-        console.log(` ⚠ ${bad.length} down — re-probing`);
+        console.log(` ⚠ ${bad.length} down - re-probing`);
         await cmdProbe();
       } else {
         console.log(" ✓ all healthy");
       }
     } catch (err: unknown) {
-      console.log(` ✗ ${err instanceof Error ? err.message : err} — re-probing`);
+      console.log(` ✗ ${err instanceof Error ? err.message : err} - re-probing`);
       await cmdProbe();
     }
   }
@@ -988,7 +988,7 @@ async function statusJson(): Promise<Response> {
       execSync(`nc -z -G 2 127.0.0.1 ${exit.port}`, { stdio: "ignore", timeout: 3000 });
       alive = true;
     } catch { /* dead */ }
-    const country = exit.country ? (COUNTRY_NAMES[exit.country] ?? exit.country) : (exit.type === "tor" ? "Tor network" : "—");
+    const country = exit.country ? (COUNTRY_NAMES[exit.country] ?? exit.country) : (exit.type === "tor" ? "Tor network" : "-");
     tunnels.push({ name: exit.name, country, port: exit.port, alive });
   }
 
@@ -1011,7 +1011,7 @@ async function statusPage(): Promise<Response> {
       execSync(`nc -z -G 2 127.0.0.1 ${exit.port}`, { stdio: "ignore", timeout: 3000 });
       alive = true;
     } catch { /* dead */ }
-    const country = exit.country ? (COUNTRY_NAMES[exit.country] ?? exit.country) : (exit.type === "tor" ? "Tor network" : "—");
+    const country = exit.country ? (COUNTRY_NAMES[exit.country] ?? exit.country) : (exit.type === "tor" ? "Tor network" : "-");
     tunnels.push({ name: exit.name, country, port: exit.port, alive });
   }
 
@@ -1120,7 +1120,7 @@ async function statusPage(): Promise<Response> {
     ${engines.map(eng => {
       const cells = exitNames.map(ex => {
         const er = lookup.get(ex)?.get(eng);
-        if (!er) return `<td class="muted">—</td>`;
+        if (!er) return `<td class="muted">-</td>`;
         if (er.status === "ok") return `<td class="ok">✓</td>`;
         return `<td class="bad" title="${er.detail ?? er.status}">✗</td>`;
       }).join("");
