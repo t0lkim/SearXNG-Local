@@ -431,7 +431,7 @@ has_vpn_configs() {
   compgen -G "${SCRIPT_DIR}/vpn-configs/*.conf" >/dev/null 2>&1
 }
 
-PROXY_PID_FILE="${SCRIPT_DIR}/.runtime/proxy-watch.pid"
+PROXY_PID_FILE="${SCRIPT_DIR}/.runtime/proxy.pid"
 
 start_proxy_watch() {
   if ! has_vpn_configs; then return; fi
@@ -445,7 +445,7 @@ start_proxy_watch() {
   local logfile="${SCRIPT_DIR}/.runtime/proxy-watch.log"
   mkdir -p "${SCRIPT_DIR}/.runtime"
   info "Starting proxy watch (log: .runtime/proxy-watch.log)..."
-  nohup bun "${SCRIPT_DIR}/proxy-manager.ts" watch >> "$logfile" 2>&1 &
+  nohup bun "${SCRIPT_DIR}/proxy-manager.ts" start >> "$logfile" 2>&1 &
   echo $! > "$PROXY_PID_FILE"
 }
 
@@ -483,7 +483,7 @@ Commands:
   status    Show container status
   teardown  Remove the container (preserves settings volume)
   reset     Remove container AND settings volume (destructive)
-  proxy     Manage VPN proxy routing (start|stop|probe|status|watch)
+  proxy     Manage VPN proxy routing (start|stop|probe|status)
   help      Show this message
 
 Runtime:
@@ -496,10 +496,9 @@ Environment:
 
 Proxy routing:
   Drop WireGuard .conf files into vpn-configs/ then run:
-    ./setup.sh proxy start   - start tunnels, probe engines, apply routes
-    ./setup.sh proxy watch   - continuous monitoring (foreground)
+    ./setup.sh proxy start   - start server, tunnels, probe, monitor
     ./setup.sh proxy status  - show health matrix
-    ./setup.sh proxy stop    - stop VPN tunnels
+    ./setup.sh proxy stop    - stop everything
 EOF
 }
 

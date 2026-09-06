@@ -4,7 +4,7 @@ import { readdir, readFile, writeFile, mkdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
 
-const VERSION = "0.8.0";
+const VERSION = "0.8.1";
 const ROOT = import.meta.dir;
 const VPN_DIR = join(ROOT, "vpn-configs");
 const RUNTIME_DIR = join(ROOT, ".runtime");
@@ -120,8 +120,9 @@ async function rotateTorCircuit(): Promise<boolean> {
   }
 }
 
-async function rotateTorUntilQwantWorks(secretKey: string): Promise<string | null> {
-  const torExit: Exit = { name: "tor", type: "tor", port: TOR_PORT };
+async function rotateTorUntilQwantWorks(): Promise<string | null> {
+  const qwantUrl = ENGINE_URLS.find(([e]) => e === "qwant")?.[1];
+  if (!qwantUrl) return null;
 
   for (let attempt = 1; attempt <= TOR_RETRY_MAX; attempt++) {
     console.log(`  Tor circuit rotation attempt ${attempt}/${TOR_RETRY_MAX}...`);
@@ -129,16 +130,14 @@ async function rotateTorUntilQwantWorks(secretKey: string): Promise<string | nul
       console.log("    ✗ circuit rotation failed (control port)");
       continue;
     }
-    // Wait for new circuit to establish
     await Bun.sleep(3000);
 
-    const probe = await probeExit(torExit, secretKey);
-    const qwant = probe.engines.find(e => e.engine === "qwant");
-    if (qwant?.status === "ok") {
+    const result = await directProbeEngine("qwant", qwantUrl, TOR_PORT);
+    if (result.status === "ok") {
       console.log(`    ✓ qwant works on new Tor circuit`);
       return "tor";
     }
-    console.log(`    ✗ qwant still ${qwant?.status ?? "missing"}`);
+    console.log(`    ✗ qwant still ${result.status}`);
   }
   return null;
 }
@@ -151,15 +150,10 @@ function wgToWireproxyConfig(wgContent: string, socksPort: number): string {
     const line = raw.trim();
     if (!line || line.startsWith("#")) continue;
 
-    if (line.startsWith("Address")) {
+    const key = ["Address", "DNS", "AllowedIPs"].find(k => line.startsWith(k));
+    if (key) {
       const v4 = line.split("=")[1].split(",").map(s => s.trim()).filter(s => !s.includes(":"));
-      lines.push(`Address = ${v4.join(", ")}`);
-    } else if (line.startsWith("DNS")) {
-      const v4 = line.split("=")[1].split(",").map(s => s.trim()).filter(s => !s.includes(":"));
-      lines.push(`DNS = ${v4.join(", ")}`);
-    } else if (line.startsWith("AllowedIPs")) {
-      const v4 = line.split("=")[1].split(",").map(s => s.trim()).filter(s => !s.includes(":"));
-      lines.push(`AllowedIPs = ${v4.join(", ")}`);
+      lines.push(`${key} = ${v4.join(", ")}`);
     } else {
       lines.push(line);
     }
@@ -375,31 +369,6 @@ function engineEnablements(): string {
   return ENABLE_ENGINES.map(e => `  - name: ${e}\n    disabled: false`).join("\n");
 }
 
-function settingsForProbe(secretKey: string, proxyUrl: string): string {
-  return `use_default_settings: true
-
-server:
-  secret_key: "${secretKey}"
-  image_proxy: true
-
-search:
-  formats:
-    - html
-    - json
-
-outgoing:
-  proxies:
-    "all://":
-      - "${proxyUrl}"
-  request_timeout: 10.0
-  max_request_timeout: 15.0
-  useragent_suffix: ""
-
-engines:
-${engineEnablements()}
-`;
-}
-
 function settingsOptimal(
   secretKey: string,
   exits: Exit[],
@@ -456,52 +425,6 @@ ${engineSection}`;
 
 // ─── Health probing ─────────────────────────────────────────
 
-async function probeExit(exit: Exit, secretKey: string): Promise<ExitProbe> {
-  const proxyUrl = `socks5h://host.containers.internal:${exit.port}`;
-  process.stdout.write(`  probing ${exit.name}...`);
-
-  await applySettings(settingsForProbe(secretKey, proxyUrl));
-  if (!(await waitForReady())) {
-    console.log(" ⚠ SearXNG didn't come up");
-    return { exit: exit.name, engines: [] };
-  }
-
-  try {
-    const res = await fetch(`${SEARXNG_URL}/search?q=test&format=json`, {
-      signal: AbortSignal.timeout(PROBE_TIMEOUT),
-    });
-    if (!res.ok) {
-      console.log(` ⚠ HTTP ${res.status}`);
-      return { exit: exit.name, engines: [] };
-    }
-
-    const data = (await res.json()) as {
-      results?: { engine: string }[];
-      unresponsive_engines?: [string, string][];
-    };
-
-    const engines: EngineResult[] = [];
-    const ok = new Set<string>();
-    for (const r of data.results ?? []) ok.add(r.engine);
-    for (const e of ok) engines.push({ engine: e, status: "ok" });
-
-    for (const [name, reason] of data.unresponsive_engines ?? []) {
-      const lower = reason.toLowerCase();
-      let status: EngineResult["status"] = "blocked";
-      if (lower.includes("captcha")) status = "captcha";
-      else if (lower.includes("timeout")) status = "timeout";
-      engines.push({ engine: name, status, detail: reason });
-    }
-
-    console.log(` ✓ ${ok.size} ok, ${(data.unresponsive_engines ?? []).length} blocked`);
-    return { exit: exit.name, engines };
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.log(` ✗ ${msg}`);
-    return { exit: exit.name, engines: [] };
-  }
-}
-
 const ENGINE_URLS: [string, string][] = [
   ["bing", "https://www.bing.com/search?q=test"],
   ["brave", "https://search.brave.com/search?q=test"],
@@ -554,13 +477,11 @@ async function directProbeEngine(
   }
 }
 
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
-
 async function directProbeExit(exit: Exit): Promise<ExitProbe> {
   const results: EngineResult[] = [];
   for (const [eng, url] of ENGINE_URLS) {
     results.push(await directProbeEngine(eng, url, exit.port));
-    if (results.length < ENGINE_URLS.length) await sleep(500);
+    if (results.length < ENGINE_URLS.length) await Bun.sleep(500);
   }
   const ok = results.filter(r => r.status === "ok").length;
   const bad = results.length - ok;
@@ -568,7 +489,7 @@ async function directProbeExit(exit: Exit): Promise<ExitProbe> {
   return { exit: exit.name, engines: results };
 }
 
-async function fullProbe(exits: Exit[], _secretKey: string): Promise<ExitProbe[]> {
+async function fullProbe(exits: Exit[]): Promise<ExitProbe[]> {
   return Promise.all(exits.map(exit => directProbeExit(exit)));
 }
 
@@ -612,8 +533,96 @@ function optimise(probes: ExitProbe[]): { assignments: Record<string, string>; d
 
 // ─── CLI commands ───────────────────────────────────────────
 
+async function initialProbeAndRoute(activeExits: Exit[]) {
+  const secretKey = await getSecretKey();
+  console.log("Running health probe (one SearXNG search per exit)...");
+  const probes = await fullProbe(activeExits);
+
+  console.log("\nOptimising routes...");
+  const { assignments, defaultExit } = optimise(probes);
+  console.log(`  default: ${defaultExit}`);
+  for (const [eng, exit] of Object.entries(assignments)) {
+    console.log(`  ${eng} → ${exit}`);
+  }
+
+  console.log("\nApplying optimal routes...");
+  const yaml = settingsOptimal(secretKey, activeExits, assignments, defaultExit);
+  await applySettings(yaml);
+  if (await waitForReady()) {
+    console.log("✓ SearXNG running with optimal proxy routes\n");
+  } else {
+    console.log("⚠ SearXNG may not have started correctly\n");
+  }
+
+  // Verify and re-route engines that fail on the default
+  console.log("Verifying...");
+  try {
+    const res = await fetch(`${SEARXNG_URL}/search?q=test&format=json`, {
+      signal: AbortSignal.timeout(PROBE_TIMEOUT),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const text = await res.text();
+    let data: { results?: unknown[]; unresponsive_engines?: [string, string][] };
+    try { data = JSON.parse(text); } catch { throw new Error("response not JSON"); }
+    const ok = new Set((data.results as { engine: string }[])?.map(r => r.engine) ?? []);
+    const blocked = data.unresponsive_engines ?? [];
+    console.log(`  ${ok.size} engines responding, ${blocked.length} unresponsive`);
+
+    let rerouted = false;
+    const savedProbes = (await loadHealthMatrix())?.probes ?? [];
+
+    for (const [name, reason] of blocked) {
+      if (assignments[name]) continue;
+      const engineProbes = probes.flatMap(p =>
+        p.engines.filter(e => e.engine === name && e.status === "ok").map(() => p.exit),
+      );
+      let alt = engineProbes.find(e => e !== defaultExit);
+      if (!alt && savedProbes.length > 0) {
+        for (const p of savedProbes) {
+          if (p.exit === defaultExit) continue;
+          if (p.engines.some(e => e.engine === name && e.status === "ok")) { alt = p.exit; break; }
+        }
+      }
+      if (alt) {
+        console.log(`    ✗ ${name}: ${reason} → re-routing to ${alt}`);
+        assignments[name] = alt;
+        rerouted = true;
+      } else if (reason.toLowerCase().includes("captcha")) {
+        console.log(`    ✗ ${name}: ${reason} → trying Tor circuit rotation`);
+        const torAlt = await rotateTorUntilQwantWorks();
+        if (torAlt) { assignments[name] = torAlt; rerouted = true; }
+        else console.log(`    ✗ ${name}: exhausted ${TOR_RETRY_MAX} circuit rotations`);
+      } else {
+        console.log(`    ✗ ${name}: ${reason} (no alternative)`);
+      }
+    }
+
+    if (rerouted) {
+      console.log("\n  Re-applying with corrected routes...");
+      const fixedYaml = settingsOptimal(secretKey, activeExits, assignments, defaultExit);
+      await applySettings(fixedYaml);
+      await waitForReady();
+      console.log("  ✓ Routes corrected");
+    }
+  } catch (err: unknown) {
+    console.log(`  ⚠ verification skipped: ${err instanceof Error ? err.message : err}`);
+  }
+
+  const matrix: HealthMatrix = {
+    timestamp: new Date().toISOString(),
+    probes,
+    assignments: { _default: defaultExit, ...assignments },
+  };
+  await writeFile(HEALTH_FILE, JSON.stringify(matrix, null, 2));
+  console.log(`\nHealth matrix saved to .runtime/health-matrix.json`);
+}
+
 async function cmdStart() {
   await mkdir(RUNTIME_DIR, { recursive: true });
+
+  // Server starts immediately
+  startStatusServer();
+  console.log(`Dashboard: http://localhost:${PROXY_PORT}/stats\n`);
 
   console.log("Discovering exits...");
   const allExits = await discoverExits();
@@ -633,100 +642,63 @@ async function cmdStart() {
   const activeExits = await startProxies(allExits);
   console.log(`\n${activeExits.length} active exits\n`);
 
-  // Probe
-  const secretKey = await getSecretKey();
-  console.log("Running health probe (one SearXNG search per exit)...");
-  const probes = await fullProbe(activeExits, secretKey);
+  // Probe, optimise, verify - then monitor
+  await initialProbeAndRoute(activeExits);
 
-  // Optimise
-  console.log("\nOptimising routes...");
-  const { assignments, defaultExit } = optimise(probes);
-  console.log(`  default: ${defaultExit}`);
-  for (const [eng, exit] of Object.entries(assignments)) {
-    console.log(`  ${eng} → ${exit}`);
-  }
+  let knownExits = await discoverExits();
+  console.log(`Monitoring every ${MONITOR_INTERVAL / 1000}s... (Ctrl-C to stop)\n`);
 
-  // Apply
-  console.log("\nApplying optimal routes...");
-  const yaml = settingsOptimal(secretKey, activeExits, assignments, defaultExit);
-  await applySettings(yaml);
-  if (await waitForReady()) {
-    console.log("✓ SearXNG running with optimal proxy routes\n");
-  } else {
-    console.log("⚠ SearXNG may not have started correctly\n");
-  }
+  while (true) {
+    await Bun.sleep(MONITOR_INTERVAL);
+    const ts = new Date().toISOString();
 
-  // Verify and re-route engines that fail on the default despite passing the probe
-  console.log("Verifying...");
-  try {
-    const res = await fetch(`${SEARXNG_URL}/search?q=test&format=json`, {
-      signal: AbortSignal.timeout(PROBE_TIMEOUT),
-    });
-    const data = (await res.json()) as {
-      results?: unknown[];
-      unresponsive_engines?: [string, string][];
-    };
-    const ok = new Set((data.results as { engine: string }[])?.map(r => r.engine) ?? []);
-    const blocked = data.unresponsive_engines ?? [];
-    console.log(`  ${ok.size} engines responding, ${blocked.length} unresponsive`);
+    const freshExits = await discoverExits();
+    const oldNames = new Set(knownExits.filter(e => e.type === "vpn").map(e => e.name));
+    const newNames = new Set(freshExits.filter(e => e.type === "vpn").map(e => e.name));
+    const added = [...newNames].filter(n => !oldNames.has(n));
+    const removed = [...oldNames].filter(n => !newNames.has(n));
+    if (added.length > 0 || removed.length > 0) {
+      if (added.length > 0) console.log(`[${ts}] new configs: ${added.join(", ")}`);
+      if (removed.length > 0) console.log(`[${ts}] removed configs: ${removed.join(", ")}`);
+      await syncProxies(freshExits);
+      knownExits = freshExits;
+      console.log(`[${ts}] re-probing after config change`);
+      await cmdProbe();
+      continue;
+    }
+    knownExits = freshExits;
 
-    // Re-route engines that failed verification but have working alternatives
-    let rerouted = false;
-    let savedProbes: ExitProbe[] = [];
+    process.stdout.write(`[${ts}] tunnel check...`);
+    const revived = await restartDeadTunnels(knownExits);
+    if (revived > 0) {
+      console.log(` ${revived} tunnel(s) restarted - re-probing`);
+      await cmdProbe();
+      continue;
+    }
+    console.log(" tunnels ok");
+
+    process.stdout.write(`[${ts}] engine check...`);
     try {
-      savedProbes = (JSON.parse(await readFile(HEALTH_FILE, "utf-8")) as HealthMatrix).probes;
-    } catch { /* no saved matrix */ }
-
-    for (const [name, reason] of blocked) {
-      if (assignments[name]) continue;
-      const engineProbes = probes.flatMap(p =>
-        p.engines.filter(e => e.engine === name && e.status === "ok").map(() => p.exit),
-      );
-      let alt = engineProbes.find(e => e !== defaultExit);
-      // Fall back to historical probe data
-      if (!alt && savedProbes.length > 0) {
-        for (const p of savedProbes) {
-          if (p.exit === defaultExit) continue;
-          if (p.engines.some(e => e.engine === name && e.status === "ok")) { alt = p.exit; break; }
-        }
+      const res = await fetch(`${SEARXNG_URL}/search?q=test&format=json`, {
+        signal: AbortSignal.timeout(PROBE_TIMEOUT),
+      });
+      if (!res.ok) {
+        console.log(` ⚠ HTTP ${res.status} (rate limited) - skipping`);
+        continue;
       }
-      if (alt) {
-        console.log(`    ✗ ${name}: ${reason} → re-routing to ${alt}`);
-        assignments[name] = alt;
-        rerouted = true;
-      } else if (reason.toLowerCase().includes("captcha")) {
-        console.log(`    ✗ ${name}: ${reason} → trying Tor circuit rotation`);
-        const torAlt = await rotateTorUntilQwantWorks(secretKey);
-        if (torAlt) {
-          assignments[name] = torAlt;
-          rerouted = true;
-        } else {
-          console.log(`    ✗ ${name}: exhausted ${TOR_RETRY_MAX} circuit rotations`);
-        }
+      const data = (await res.json()) as { unresponsive_engines?: [string, string][] };
+      const bad = data.unresponsive_engines ?? [];
+      if (bad.length > 0) {
+        console.log(` ⚠ ${bad.length} down - re-probing`);
+        await cmdProbe();
       } else {
-        console.log(`    ✗ ${name}: ${reason} (no alternative)`);
+        console.log(" ✓ all healthy");
       }
+    } catch (err: unknown) {
+      console.log(` ✗ ${err instanceof Error ? err.message : err} - re-probing`);
+      await cmdProbe();
     }
-
-    if (rerouted) {
-      console.log("\n  Re-applying with corrected routes...");
-      const fixedYaml = settingsOptimal(secretKey, activeExits, assignments, defaultExit);
-      await applySettings(fixedYaml);
-      await waitForReady();
-      console.log("  ✓ Routes corrected");
-    }
-  } catch (err: unknown) {
-    console.log(`  ⚠ verification failed: ${err instanceof Error ? err.message : err}`);
   }
-
-  // Save matrix
-  const matrix: HealthMatrix = {
-    timestamp: new Date().toISOString(),
-    probes,
-    assignments: { _default: defaultExit, ...assignments },
-  };
-  await writeFile(HEALTH_FILE, JSON.stringify(matrix, null, 2));
-  console.log(`\nHealth matrix saved to .runtime/health-matrix.json`);
 }
 
 async function cmdStop() {
@@ -755,7 +727,7 @@ async function cmdProbe() {
 
   const secretKey = await getSecretKey();
   console.log(`Re-probing ${reachable.length} exits...`);
-  const probes = await fullProbe(reachable, secretKey);
+  const probes = await fullProbe(reachable);
   const { assignments, defaultExit } = optimise(probes);
 
   const yaml = settingsOptimal(secretKey, exits, assignments, defaultExit);
@@ -772,14 +744,11 @@ async function cmdProbe() {
 }
 
 async function cmdStatus() {
-  let raw: string;
-  try {
-    raw = await readFile(HEALTH_FILE, "utf-8");
-  } catch {
+  const matrix = await loadHealthMatrix();
+  if (!matrix) {
     console.log("No health matrix. Run: bun proxy-manager.ts start");
     return;
   }
-  const matrix: HealthMatrix = JSON.parse(raw);
   console.log(`Last probe: ${matrix.timestamp}\n`);
 
   const allEngines = new Set<string>();
@@ -816,71 +785,6 @@ async function cmdStatus() {
   console.log(`  (default) → ${def}`);
   for (const [eng, exit] of Object.entries(matrix.assignments)) {
     if (eng !== "_default") console.log(`  ${eng} → ${exit}`);
-  }
-}
-
-async function cmdWatch() {
-  console.log("Starting proxy manager in watch mode...\n");
-  startStatusServer();
-  await cmdStart();
-
-  let knownExits = await discoverExits();
-  console.log(`Monitoring every ${MONITOR_INTERVAL / 1000}s... (Ctrl-C to stop)\n`);
-
-  while (true) {
-    await Bun.sleep(MONITOR_INTERVAL);
-    const ts = new Date().toISOString();
-
-    // Re-scan for added/removed configs
-    const freshExits = await discoverExits();
-    const oldNames = new Set(knownExits.filter(e => e.type === "vpn").map(e => e.name));
-    const newNames = new Set(freshExits.filter(e => e.type === "vpn").map(e => e.name));
-    const added = [...newNames].filter(n => !oldNames.has(n));
-    const removed = [...oldNames].filter(n => !newNames.has(n));
-    if (added.length > 0 || removed.length > 0) {
-      if (added.length > 0) console.log(`[${ts}] new configs: ${added.join(", ")}`);
-      if (removed.length > 0) console.log(`[${ts}] removed configs: ${removed.join(", ")}`);
-      await syncProxies(freshExits);
-      knownExits = freshExits;
-      console.log(`[${ts}] re-probing after config change`);
-      await cmdProbe();
-      continue;
-    }
-    knownExits = freshExits;
-
-    // Tunnel health
-    process.stdout.write(`[${ts}] tunnel check...`);
-    const revived = await restartDeadTunnels(knownExits);
-    if (revived > 0) {
-      console.log(` ${revived} tunnel(s) restarted - re-probing`);
-      await cmdProbe();
-      continue;
-    }
-    console.log(" tunnels ok");
-
-    // Engine health
-    process.stdout.write(`[${ts}] engine check...`);
-    try {
-      const res = await fetch(`${SEARXNG_URL}/search?q=test&format=json`, {
-        signal: AbortSignal.timeout(PROBE_TIMEOUT),
-      });
-      if (!res.ok) {
-        console.log(` ⚠ HTTP ${res.status} - re-probing`);
-        await cmdProbe();
-        continue;
-      }
-      const data = (await res.json()) as { unresponsive_engines?: [string, string][] };
-      const bad = data.unresponsive_engines ?? [];
-      if (bad.length > 0) {
-        console.log(` ⚠ ${bad.length} down - re-probing`);
-        await cmdProbe();
-      } else {
-        console.log(" ✓ all healthy");
-      }
-    } catch (err: unknown) {
-      console.log(` ✗ ${err instanceof Error ? err.message : err} - re-probing`);
-      await cmdProbe();
-    }
   }
 }
 
@@ -998,10 +902,13 @@ function startStatusServer() {
           redirect: "manual",
           signal: AbortSignal.timeout(30_000),
         });
+        const fwdHeaders = new Headers(upstream.headers);
+        fwdHeaders.delete("content-encoding");
+        fwdHeaders.delete("content-length");
         return new Response(upstream.body, {
           status: upstream.status,
           statusText: upstream.statusText,
-          headers: upstream.headers,
+          headers: fwdHeaders,
         });
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -1030,46 +937,32 @@ async function statusLog(url: URL): Promise<Response> {
   }
 }
 
-async function statusJson(): Promise<Response> {
-  let matrix: HealthMatrix | null = null;
-  try {
-    matrix = JSON.parse(await readFile(HEALTH_FILE, "utf-8"));
-  } catch { /* no matrix yet */ }
-
-  const tunnels: { name: string; country: string; port: number; alive: boolean }[] = [];
+async function getTunnelStatus(): Promise<{ name: string; country: string; port: number; alive: boolean }[]> {
   const exits = await discoverExits();
-  for (const exit of exits) {
+  return exits.map(exit => {
     let alive = false;
     try {
       execSync(`nc -z -G 2 127.0.0.1 ${exit.port}`, { stdio: "ignore", timeout: 3000 });
       alive = true;
     } catch { /* dead */ }
     const country = exit.country ? (COUNTRY_NAMES[exit.country] ?? exit.country) : (exit.type === "tor" ? "Tor network" : "-");
-    tunnels.push({ name: exit.name, country, port: exit.port, alive });
-  }
+    return { name: exit.name, country, port: exit.port, alive };
+  });
+}
 
+async function loadHealthMatrix(): Promise<HealthMatrix | null> {
+  try { return JSON.parse(await readFile(HEALTH_FILE, "utf-8")); } catch { return null; }
+}
+
+async function statusJson(): Promise<Response> {
+  const [matrix, tunnels] = await Promise.all([loadHealthMatrix(), getTunnelStatus()]);
   return Response.json({ matrix, tunnels }, {
     headers: { "Access-Control-Allow-Origin": "*" },
   });
 }
 
 async function statusPage(): Promise<Response> {
-  let matrix: HealthMatrix | null = null;
-  try {
-    matrix = JSON.parse(await readFile(HEALTH_FILE, "utf-8"));
-  } catch { /* no matrix yet */ }
-
-  const tunnels: { name: string; country: string; port: number; alive: boolean }[] = [];
-  const exits = await discoverExits();
-  for (const exit of exits) {
-    let alive = false;
-    try {
-      execSync(`nc -z -G 2 127.0.0.1 ${exit.port}`, { stdio: "ignore", timeout: 3000 });
-      alive = true;
-    } catch { /* dead */ }
-    const country = exit.country ? (COUNTRY_NAMES[exit.country] ?? exit.country) : (exit.type === "tor" ? "Tor network" : "-");
-    tunnels.push({ name: exit.name, country, port: exit.port, alive });
-  }
+  const [matrix, tunnels] = await Promise.all([loadHealthMatrix(), getTunnelStatus()]);
 
   const defaultExit = matrix?.assignments._default ?? "unknown";
   const assignments = matrix?.assignments ?? {};
@@ -1155,8 +1048,10 @@ async function statusPage(): Promise<Response> {
 <div class="grid">
   <div class="card">
     <h2>Engine Issues</h2>
+    <div id="engine-container" style="min-height: 20rem;">
     <table>
       <tr><th>Engine</th><th>Exit</th><th>Status</th><th></th></tr>
+      <tbody id="engine-rows">
       ${engines.filter(eng => {
         const route = assignments[eng] ?? defaultExit;
         const probe = lookup.get(route)?.get(eng);
@@ -1168,14 +1063,23 @@ async function statusPage(): Promise<Response> {
         const status = probe?.status ?? "unknown";
         const statusClass = status === "timeout" ? "warn" : status === "unknown" ? "muted" : "bad";
         const tagClass = isCustom ? "routed" : "default";
-        return `<tr><td>${eng}</td><td><span class="tag ${tagClass}">${route}</span></td><td class="${statusClass}">${status}</td><td><button class="reprobe-btn" onclick="reprobe('${eng}', this)">reprobe</button></td></tr>`;
+        return `<tr class="engine-row"><td>${eng}</td><td><span class="tag ${tagClass}">${route}</span></td><td class="${statusClass}">${status}</td><td><button class="reprobe-btn" onclick="reprobe('${eng}', this)">reprobe</button></td></tr>`;
       }).join("\n      ") || '<tr><td colspan="4" class="ok">All engines routing OK</td></tr>'}
+      </tbody>
     </table>
+    </div>
+    ${`<div id="engine-pager" style="display:none; align-items:center; justify-content:center; gap:0.5rem; margin-top:0.5rem; font-size:0.8rem;">
+      <button class="reprobe-btn" onclick="enginePage(0)" title="First">&laquo;</button>
+      <button class="reprobe-btn" onclick="enginePage(engineState.page-1)" title="Previous">&lsaquo;</button>
+      <span id="engine-page-info" class="muted"></span>
+      <button class="reprobe-btn" onclick="enginePage(engineState.page+1)" title="Next">&rsaquo;</button>
+      <button class="reprobe-btn" onclick="enginePage(engineState.pages-1)" title="Last">&raquo;</button>
+    </div>`}
   </div>
 
   <div class="card">
     <h2>Tunnels <span class="muted" style="font-size:0.75em; font-weight:normal">(${tunnels.length})</span></h2>
-    <div id="tunnel-container">
+    <div id="tunnel-container" style="min-height: 20rem;">
     <table>
       <tr><th>Exit</th><th>Country</th><th>Port</th><th>Status</th></tr>
       <tbody id="tunnel-rows">
@@ -1185,13 +1089,13 @@ async function statusPage(): Promise<Response> {
       </tbody>
     </table>
     </div>
-    ${tunnels.length > 10 ? `<div id="tunnel-pager" style="display:flex; align-items:center; justify-content:center; gap:0.5rem; margin-top:0.5rem; font-size:0.8rem;">
+    ${`<div id="tunnel-pager" style="display:none; align-items:center; justify-content:center; gap:0.5rem; margin-top:0.5rem; font-size:0.8rem;">
       <button class="reprobe-btn" onclick="tunnelPage(0)" title="First">&laquo;</button>
       <button class="reprobe-btn" onclick="tunnelPage(tunnelState.page-1)" title="Previous">&lsaquo;</button>
       <span id="tunnel-page-info" class="muted"></span>
       <button class="reprobe-btn" onclick="tunnelPage(tunnelState.page+1)" title="Next">&rsaquo;</button>
       <button class="reprobe-btn" onclick="tunnelPage(tunnelState.pages-1)" title="Last">&raquo;</button>
-    </div>` : ""}
+    </div>`}
   </div>
 </div>
 
@@ -1217,18 +1121,25 @@ async function statusPage(): Promise<Response> {
 </div>
 
 <script>
-const TUNNEL_PAGE_SIZE = 10;
-const tunnelState = { page: 0, pages: 0 };
-function tunnelPage(p) {
-  const rows = document.querySelectorAll(".tunnel-row");
-  tunnelState.pages = Math.ceil(rows.length / TUNNEL_PAGE_SIZE);
-  tunnelState.page = Math.max(0, Math.min(p, tunnelState.pages - 1));
-  const start = tunnelState.page * TUNNEL_PAGE_SIZE;
-  rows.forEach((r, i) => r.style.display = (i >= start && i < start + TUNNEL_PAGE_SIZE) ? "" : "none");
-  const info = document.getElementById("tunnel-page-info");
-  if (info) info.textContent = (tunnelState.page + 1) + " / " + tunnelState.pages;
+const PAGE_SIZE = 10;
+function paginate(rowClass, pagerEl, stateObj) {
+  return function(p) {
+    const rows = document.querySelectorAll("." + rowClass);
+    stateObj.pages = Math.ceil(rows.length / PAGE_SIZE);
+    stateObj.page = Math.max(0, Math.min(p, stateObj.pages - 1));
+    const start = stateObj.page * PAGE_SIZE;
+    rows.forEach((r, i) => r.style.display = (i >= start && i < start + PAGE_SIZE) ? "" : "none");
+    const info = pagerEl.querySelector("span");
+    if (info) info.textContent = (stateObj.page + 1) + " / " + stateObj.pages;
+    pagerEl.style.display = stateObj.pages > 1 ? "flex" : "none";
+  };
 }
-if (document.querySelectorAll(".tunnel-row").length > TUNNEL_PAGE_SIZE) tunnelPage(0);
+const tunnelState = { page: 0, pages: 0 };
+const tunnelPage = paginate("tunnel-row", document.getElementById("tunnel-pager"), tunnelState);
+if (document.querySelectorAll(".tunnel-row").length > 0) tunnelPage(0);
+const engineState = { page: 0, pages: 0 };
+const enginePage = paginate("engine-row", document.getElementById("engine-pager"), engineState);
+if (document.querySelectorAll(".engine-row").length > 0) enginePage(0);
 
 async function refreshLog() {
   try {
@@ -1273,11 +1184,10 @@ function usage() {
   console.log(`Usage: bun proxy-manager.ts <command>
 
 Commands:
-  start   Start proxies, probe engines, apply optimal routes
-  stop    Stop all wireproxy instances
-  probe   Re-probe and re-optimise (proxies must be running)
-  status  Show current health matrix and route assignments
-  watch   Start + continuous monitoring (foreground)
+  start   Start server, tunnels, probe, monitor (foreground)
+  stop    Stop everything
+  probe   Re-probe and re-optimise (must be running)
+  status  Show current health matrix and routes
 
 Prerequisites:
   wireproxy   go install github.com/windtf/wireproxy/cmd/wireproxy@latest
@@ -1304,6 +1214,5 @@ switch (cmd) {
   case "stop": await cmdStop(); break;
   case "probe": await cmdProbe(); break;
   case "status": await cmdStatus(); break;
-  case "watch": await cmdWatch(); break;
   default: usage();
 }

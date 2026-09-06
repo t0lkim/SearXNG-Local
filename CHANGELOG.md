@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.8.1] - 2026-09-06
+
+CLI simplification, dead code removal, 403 rate-limit fix.
+
+- **Breaking:** `watch` subcommand removed - `start` now does everything (server, tunnels, probes, monitoring)
+- **Fix:** 403 from SearXNG rate limiter no longer triggers cascading re-probes that kill tunnels
+- **Fix:** Verification step handles non-JSON responses (403/HTML) without crashing
+- Server starts immediately on `start` - dashboard available in seconds, probes run behind it
+- Engine Issues table paginated (10 per page, pager only when >10) matching tunnel table
+- Fixed-height table containers (20rem) prevent layout shift when fewer than 10 rows
+- Remove dead `probeExit`/`settingsForProbe` (~50 lines) - Tor circuit rotation now uses `directProbeEngine`
+- Remove `sleep` utility - use `Bun.sleep` directly
+- Remove unused `_secretKey` param from `fullProbe`
+- Collapse triplicated IPv6 filter to single array check
+- Extract `getTunnelStatus()` and `loadHealthMatrix()` helpers - deduplicates statusJson/statusPage
+- ~103 lines removed total
+
 ## [0.8.0] - 2026-09-06
 
 Hot-add VPN configs, stable port assignment, tunnel pagination.
