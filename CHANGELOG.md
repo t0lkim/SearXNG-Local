@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.8.4] - 2026-09-06
+
+- **Fix:** False-positive CAPTCHA detection on GMX - tighten pattern matching from bare keywords (`recaptcha`, `hcaptcha`, `captcha`) to specific integration markers (`g-recaptcha`, `recaptcha/api`, `hcaptcha.com`) so that template CSS/JS containing those words no longer triggers a false block
+
 ## [0.8.3] - 2026-09-06
 
 - **Fix:** `stop` now kills orphaned proxy-manager processes not tracked by the pidfile (previously `restart` left the old process running)
