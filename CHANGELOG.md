@@ -3,6 +3,7 @@
 ## [0.8.4] - 2026-09-06
 
 - **Fix:** False-positive CAPTCHA detection on GMX - tighten pattern matching from bare keywords (`recaptcha`, `hcaptcha`, `captcha`) to specific integration markers (`g-recaptcha`, `recaptcha/api`, `hcaptcha.com`) so that template CSS/JS containing those words no longer triggers a false block
+- Document Bing Cloudflare Turnstile blocking in README (affects all VPN/Tor exits, no workaround)
 
 ## [0.8.3] - 2026-09-06
 

@@ -79,6 +79,8 @@ For manual control:
 
 The reverse proxy starts immediately - search is available while the first probe cycle runs in the background. The health matrix is saved to `.runtime/health-matrix.json` and used as a historical fallback when a current probe shows no alternative for a blocked engine.
 
+**Note:** Bing serves Cloudflare Turnstile challenges to all known VPN and Tor IP ranges, so it will always show as blocked in the health matrix. This is a Bing-side restriction with no workaround through proxy routing.
+
 ## Usage
 
 ```bash
