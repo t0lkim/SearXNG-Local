@@ -4,6 +4,7 @@ import { readdir, readFile, writeFile, mkdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
 
+const VERSION = "0.7.2";
 const ROOT = import.meta.dir;
 const VPN_DIR = join(ROOT, "vpn-configs");
 const RUNTIME_DIR = join(ROOT, ".runtime");
@@ -41,7 +42,7 @@ const CONTAINER_RUNTIME = detectRuntime();
 
 const COUNTRY_NAMES: Record<string, string> = {
   AT: "Austria", AU: "Australia", BE: "Belgium", BG: "Bulgaria", BR: "Brazil",
-  CA: "Canada", CH: "Switzerland", CZ: "Czechia", DE: "Germany", DK: "Denmark",
+  CA: "Canada", CH: "Switzerland", CZ: "Czech Republic", DE: "Germany", DK: "Denmark",
   EE: "Estonia", ES: "Spain", FI: "Finland", FR: "France", GB: "United Kingdom",
   GR: "Greece", HK: "Hong Kong", HR: "Croatia", HU: "Hungary", ID: "Indonesia",
   IE: "Ireland", IL: "Israel", IN: "India", IS: "Iceland", IT: "Italy",
@@ -1035,10 +1036,18 @@ async function statusPage(): Promise<Response> {
     }
   }
   const exitNames = matrix?.probes.map(p => p.exit) ?? [];
-  const okCount = engines.filter(eng => {
+  const issueCount = engines.filter(eng => {
     const route = assignments[eng] ?? defaultExit;
-    return lookup.get(route)?.get(eng)?.status === "ok";
+    return lookup.get(route)?.get(eng)?.status !== "ok";
   }).length;
+
+  let totalEnabled = 0;
+  try {
+    const res = await fetch(`http://127.0.0.1:${SEARXNG_INTERNAL_PORT}/config`);
+    const cfg = await res.json() as { engines?: { enabled?: boolean }[] };
+    totalEnabled = (cfg.engines ?? []).filter((e: { enabled?: boolean }) => e.enabled !== false).length;
+  } catch { /* SearXNG not ready yet */ }
+  const activeCount = totalEnabled > 0 ? totalEnabled - issueCount : 0;
 
   const probeAge = matrix
     ? Math.round((Date.now() - new Date(matrix.timestamp).getTime()) / 60_000)
@@ -1085,8 +1094,8 @@ async function statusPage(): Promise<Response> {
 </style>
 </head>
 <body>
-<h1>SearXNG Proxy Status</h1>
-<p class="subtitle">Last probe: ${probeAge !== null ? `${probeAge}m ago` : "never"} &bull; Default exit: <strong>${defaultExit}</strong> &bull; Active engines: <strong>${okCount}</strong> <a class="refresh" onclick="location.reload()">refresh</a></p>
+<h1>SearXNG Proxy Status <span class="muted" style="font-size:0.5em; font-weight:normal">v${VERSION}</span></h1>
+<p class="subtitle">Last probe: ${probeAge !== null ? `${probeAge}m ago` : "never"} &bull; Default exit: <strong>${defaultExit}</strong> &bull; Active engines: <strong>${activeCount}/${totalEnabled}</strong> <a class="refresh" onclick="location.reload()">refresh</a></p>
 
 <div class="grid">
   <div class="card">

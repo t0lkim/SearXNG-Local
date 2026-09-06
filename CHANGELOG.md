@@ -2,7 +2,8 @@
 
 ## [0.7.2] - 2026-09-06
 
-- Show active engine count in the dashboard subtitle line
+- Show version number on dashboard
+- Active engine count on dashboard queries SearXNG `/config` for the real total (was only counting the 13 probed engines)
 - Dashboard engine table now shows only engines with issues; "All engines routing OK" when healthy
 
 ## [0.7.1] - 2026-09-06
