@@ -5,6 +5,7 @@
 - Stagger engine probes per exit (500ms between each) to prevent tunnel saturation during parallel probing
 - Follow redirects in engine probes (fixes false timeouts on Google consent redirects through EU VPN exits)
 - Increase probe timeout from 12s to 15s
+- Update README
 
 ## [0.7.3] - 2026-09-06
 

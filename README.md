@@ -1,4 +1,5 @@
 # SearXNG-Local
+I use this daily so I update it when I find bugs or add features.
 
 Run [SearXNG](https://searxng.org) locally using Apple's native [container](https://github.com/apple/container) runtime (macOS) or [Podman](https://podman.io) (GNU/Linux), with a self-managing proxy router across multiple VPN exits and Tor.
 
