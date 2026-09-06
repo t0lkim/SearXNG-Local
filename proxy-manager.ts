@@ -4,7 +4,7 @@ import { readdir, readFile, writeFile, mkdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
 
-const VERSION = "0.7.4";
+const VERSION = "0.8.0";
 const ROOT = import.meta.dir;
 const VPN_DIR = join(ROOT, "vpn-configs");
 const RUNTIME_DIR = join(ROOT, ".runtime");
@@ -170,6 +170,14 @@ function wgToWireproxyConfig(wgContent: string, socksPort: number): string {
 
 // ─── Exit discovery ─────────────────────────────────────────
 
+function stablePort(name: string): number {
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) {
+    hash = ((hash << 5) - hash + name.charCodeAt(i)) | 0;
+  }
+  return WP_BASE_PORT + (Math.abs(hash) % 1000);
+}
+
 async function discoverExits(): Promise<Exit[]> {
   const exits: Exit[] = [{ name: "tor", type: "tor", port: TOR_PORT }];
 
@@ -181,15 +189,18 @@ async function discoverExits(): Promise<Exit[]> {
   }
 
   const configs = files.filter(f => f.endsWith(".conf")).sort();
-  let port = WP_BASE_PORT;
+  const usedPorts = new Set<number>([TOR_PORT]);
   for (const file of configs) {
     const base = file.replace(/\.conf$/, "");
     const name = base.replace(/^wg-/, "").toLowerCase();
     const country = base.match(/^wg-([A-Z]{2})-/)?.[1];
+    let port = stablePort(name);
+    while (usedPorts.has(port)) port++;
+    usedPorts.add(port);
     exits.push({
       name,
       type: "vpn",
-      port: port++,
+      port,
       configFile: join(VPN_DIR, file),
       country,
     });
@@ -206,41 +217,57 @@ async function startProxies(exits: Exit[]): Promise<Exit[]> {
   try { execSync("pkill -f wireproxy 2>/dev/null", { stdio: "ignore" }); } catch { /* fine */ }
   await Bun.sleep(500);
 
+  return syncProxies(exits);
+}
+
+async function syncProxies(exits: Exit[]): Promise<Exit[]> {
   const vpnExits = exits.filter(e => e.type === "vpn" && e.configFile);
   if (vpnExits.length === 0) return exits.filter(e => e.type === "tor");
 
-  // Generate configs
-  for (const exit of vpnExits) {
-    const wg = await readFile(exit.configFile!, "utf-8");
-    const wp = wgToWireproxyConfig(wg, exit.port);
-    await writeFile(join(RUNTIME_DIR, `wp-${exit.name}.conf`), wp);
+  const wanted = new Set(vpnExits.map(e => e.name));
+
+  // Remove proxies for configs that were deleted
+  for (const [name, proc] of processes) {
+    if (!wanted.has(name)) {
+      console.log(`  removing ${name} (config deleted)`);
+      try { proc.kill(); } catch { /* already dead */ }
+      processes.delete(name);
+      try { await unlink(join(RUNTIME_DIR, `wp-${name}.conf`)); } catch { /* fine */ }
+    }
   }
 
-  // Start all in parallel
-  const spawned = vpnExits.map(exit => ({
-    exit,
-    proc: Bun.spawn([WP_BIN, "-c", join(RUNTIME_DIR, `wp-${exit.name}.conf`)], {
-      stdout: "ignore",
-      stderr: "pipe",
-    }),
-  }));
+  // Start proxies for new or missing configs
+  const toStart = vpnExits.filter(e => !processes.has(e.name));
+  if (toStart.length > 0) {
+    for (const exit of toStart) {
+      const wg = await readFile(exit.configFile!, "utf-8");
+      const wp = wgToWireproxyConfig(wg, exit.port);
+      await writeFile(join(RUNTIME_DIR, `wp-${exit.name}.conf`), wp);
+    }
 
-  // Wait for handshakes (up to 10s)
-  const results = await Promise.all(
-    spawned.map(async ({ exit, proc }) => {
-      const ok = await waitForHandshake(proc, 10_000);
-      if (ok) {
-        processes.set(exit.name, proc);
-        console.log(`  ✓ ${exit.name} (port ${exit.port})`);
-        return exit;
-      }
-      proc.kill();
-      console.log(`  ✗ ${exit.name}: failed to connect`);
-      return null;
-    })
-  );
+    const spawned = toStart.map(exit => ({
+      exit,
+      proc: Bun.spawn([WP_BIN, "-c", join(RUNTIME_DIR, `wp-${exit.name}.conf`)], {
+        stdout: "ignore",
+        stderr: "pipe",
+      }),
+    }));
 
-  const active = results.filter((e): e is Exit => e !== null);
+    await Promise.all(
+      spawned.map(async ({ exit, proc }) => {
+        const ok = await waitForHandshake(proc, 10_000);
+        if (ok) {
+          processes.set(exit.name, proc);
+          console.log(`  ✓ ${exit.name} (port ${exit.port})`);
+        } else {
+          proc.kill();
+          console.log(`  ✗ ${exit.name}: failed to connect`);
+        }
+      })
+    );
+  }
+
+  const active = vpnExits.filter(e => processes.has(e.name));
   return [exits.find(e => e.type === "tor")!, ...active];
 }
 
@@ -797,16 +824,33 @@ async function cmdWatch() {
   startStatusServer();
   await cmdStart();
 
-  const allExits = await discoverExits();
+  let knownExits = await discoverExits();
   console.log(`Monitoring every ${MONITOR_INTERVAL / 1000}s... (Ctrl-C to stop)\n`);
 
   while (true) {
     await Bun.sleep(MONITOR_INTERVAL);
     const ts = new Date().toISOString();
 
-    // Tunnel health first
+    // Re-scan for added/removed configs
+    const freshExits = await discoverExits();
+    const oldNames = new Set(knownExits.filter(e => e.type === "vpn").map(e => e.name));
+    const newNames = new Set(freshExits.filter(e => e.type === "vpn").map(e => e.name));
+    const added = [...newNames].filter(n => !oldNames.has(n));
+    const removed = [...oldNames].filter(n => !newNames.has(n));
+    if (added.length > 0 || removed.length > 0) {
+      if (added.length > 0) console.log(`[${ts}] new configs: ${added.join(", ")}`);
+      if (removed.length > 0) console.log(`[${ts}] removed configs: ${removed.join(", ")}`);
+      await syncProxies(freshExits);
+      knownExits = freshExits;
+      console.log(`[${ts}] re-probing after config change`);
+      await cmdProbe();
+      continue;
+    }
+    knownExits = freshExits;
+
+    // Tunnel health
     process.stdout.write(`[${ts}] tunnel check...`);
-    const revived = await restartDeadTunnels(allExits);
+    const revived = await restartDeadTunnels(knownExits);
     if (revived > 0) {
       console.log(` ${revived} tunnel(s) restarted - re-probing`);
       await cmdProbe();
@@ -1130,13 +1174,24 @@ async function statusPage(): Promise<Response> {
   </div>
 
   <div class="card">
-    <h2>Tunnels</h2>
+    <h2>Tunnels <span class="muted" style="font-size:0.75em; font-weight:normal">(${tunnels.length})</span></h2>
+    <div id="tunnel-container">
     <table>
       <tr><th>Exit</th><th>Country</th><th>Port</th><th>Status</th></tr>
-      ${tunnels.map(t =>
-        `<tr><td><span class="dot ${t.alive ? "alive" : "dead"}"></span>${t.name}</td><td class="muted">${t.country}</td><td>${t.port}</td><td class="${t.alive ? "ok" : "bad"}">${t.alive ? "alive" : "dead"}</td></tr>`
+      <tbody id="tunnel-rows">
+      ${tunnels.sort((a, b) => a.country.localeCompare(b.country) || a.name.localeCompare(b.name, undefined, { numeric: true })).map(t =>
+        `<tr class="tunnel-row"><td><span class="dot ${t.alive ? "alive" : "dead"}"></span>${t.name}</td><td class="muted">${t.country}</td><td>${t.port}</td><td class="${t.alive ? "ok" : "bad"}">${t.alive ? "alive" : "dead"}</td></tr>`
       ).join("\n      ")}
+      </tbody>
     </table>
+    </div>
+    ${tunnels.length > 10 ? `<div id="tunnel-pager" style="display:flex; align-items:center; justify-content:center; gap:0.5rem; margin-top:0.5rem; font-size:0.8rem;">
+      <button class="reprobe-btn" onclick="tunnelPage(0)" title="First">&laquo;</button>
+      <button class="reprobe-btn" onclick="tunnelPage(tunnelState.page-1)" title="Previous">&lsaquo;</button>
+      <span id="tunnel-page-info" class="muted"></span>
+      <button class="reprobe-btn" onclick="tunnelPage(tunnelState.page+1)" title="Next">&rsaquo;</button>
+      <button class="reprobe-btn" onclick="tunnelPage(tunnelState.pages-1)" title="Last">&raquo;</button>
+    </div>` : ""}
   </div>
 </div>
 
@@ -1162,6 +1217,19 @@ async function statusPage(): Promise<Response> {
 </div>
 
 <script>
+const TUNNEL_PAGE_SIZE = 10;
+const tunnelState = { page: 0, pages: 0 };
+function tunnelPage(p) {
+  const rows = document.querySelectorAll(".tunnel-row");
+  tunnelState.pages = Math.ceil(rows.length / TUNNEL_PAGE_SIZE);
+  tunnelState.page = Math.max(0, Math.min(p, tunnelState.pages - 1));
+  const start = tunnelState.page * TUNNEL_PAGE_SIZE;
+  rows.forEach((r, i) => r.style.display = (i >= start && i < start + TUNNEL_PAGE_SIZE) ? "" : "none");
+  const info = document.getElementById("tunnel-page-info");
+  if (info) info.textContent = (tunnelState.page + 1) + " / " + tunnelState.pages;
+}
+if (document.querySelectorAll(".tunnel-row").length > TUNNEL_PAGE_SIZE) tunnelPage(0);
+
 async function refreshLog() {
   try {
     const res = await fetch("/api/log?lines=80");

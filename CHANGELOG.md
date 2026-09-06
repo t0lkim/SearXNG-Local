@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.8.0] - 2026-09-06
+
+Hot-add VPN configs, stable port assignment, tunnel pagination.
+
+- **New:** Stable port assignment - config name hashed to a deterministic port, so adding or removing configs no longer shifts other tunnels' ports
+- **New:** Hot-add/remove VPN configs - watch cycle re-scans `vpn-configs/` each cycle; new configs start automatically, removed configs are cleaned up
+- **New:** Incremental proxy sync - only starts/stops tunnels that changed, instead of killing all and restarting
+- **New:** Tunnel pagination - tunnels table paginated at 10 per page with first/prev/next/last navigation
+- Tunnels sorted by country name then by config number
+- Dashboard tunnel count shown in section header
+
 ## [0.7.4] - 2026-09-06
 
 - Stagger engine probes per exit (500ms between each) to prevent tunnel saturation during parallel probing
