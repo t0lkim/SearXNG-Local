@@ -455,15 +455,26 @@ start_proxy_watch() {
 }
 
 stop_proxy_watch() {
+  local killed=false
   if [[ -f "$PROXY_PID_FILE" ]]; then
     local pid
     pid="$(cat "$PROXY_PID_FILE")"
     if kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null
       wait "$pid" 2>/dev/null || true
-      info "Proxy watch stopped."
+      killed=true
     fi
     rm -f "$PROXY_PID_FILE"
+  fi
+  # Kill any orphaned proxy-manager processes not tracked by the pidfile
+  local stale
+  stale="$(pgrep -f 'bun.*proxy-manager\.ts' 2>/dev/null || true)"
+  if [[ -n "$stale" ]]; then
+    echo "$stale" | xargs kill 2>/dev/null || true
+    killed=true
+  fi
+  if $killed; then
+    info "Proxy watch stopped."
   fi
 }
 

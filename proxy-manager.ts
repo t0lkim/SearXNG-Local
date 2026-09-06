@@ -4,7 +4,7 @@ import { readdir, readFile, writeFile, mkdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
 
-const VERSION = "0.8.2";
+const VERSION = "0.8.3";
 const ROOT = import.meta.dir;
 const VPN_DIR = join(ROOT, "vpn-configs");
 const RUNTIME_DIR = join(ROOT, ".runtime");
@@ -428,7 +428,7 @@ ${engineSection}`;
 const ENGINE_URLS: [string, string][] = [
   ["bing", "https://www.bing.com/search?q=test"],
   ["brave", "https://search.brave.com/search?q=test"],
-  ["crowdview", "https://www.crowdview.ai/?q=test"],
+  ["crowdview", "https://crowdview.ai/?q=test"],
   ["duckduckgo", "https://html.duckduckgo.com/html/?q=test"],
   ["gmx", "https://search.gmx.net/web?q=test"],
   ["google", "https://www.google.com/search?q=test"],
@@ -605,7 +605,10 @@ async function initialProbeAndRoute(activeExits: Exit[]) {
       console.log("  ✓ Routes corrected");
     }
   } catch (err: unknown) {
-    console.log(`  ⚠ verification skipped: ${err instanceof Error ? err.message : err}`);
+    const msg = err instanceof Error ? err.message : String(err);
+    console.log(`  ⚠ verification skipped: ${msg}`);
+    if (msg.includes("403"))
+      console.log("    SearXNG rate limiter blocked the verification query; routes are applied but unverified this cycle");
   }
 
   const matrix: HealthMatrix = {

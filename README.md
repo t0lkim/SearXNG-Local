@@ -7,6 +7,10 @@ Run [SearXNG](https://searxng.org) locally using Apple's native [container](http
 
 SearXNG is a privacy-respecting metasearch engine that aggregates results from 70+ search engines without tracking you. Many engines block requests from known VPN and Tor IP ranges. The bundled proxy manager automatically routes each engine through whichever exit isn't blocking it, monitors for changes, and re-routes on the fly.
 
+![SearXNG search interface](screenshots/search.png)
+
+![Proxy status dashboard](screenshots/dashboard.png)
+
 ## Prerequisites
 
 ### macOS (Apple Silicon)

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.3] - 2026-09-06
+
+- **Fix:** `stop` now kills orphaned proxy-manager processes not tracked by the pidfile (previously `restart` left the old process running)
+- **Fix:** Crowdview probe URL corrected from `www.crowdview.ai` to `crowdview.ai` (the `www` subdomain has no DNS record, causing 100% timeout on every exit)
+- Improve 403 verification-skip message to explain SearXNG rate limiter is the cause
+- Add screenshots to README (search interface and proxy status dashboard)
+
 ## [0.8.2] - 2026-09-06
 
 - Add `restart` command to setup.sh (stop + start in one step)
