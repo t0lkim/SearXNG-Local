@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.6.0] — 2026-09-06
+
+Dual-runtime support: Apple container (macOS) + Podman (GNU/Linux).
+
+- **New:** Apple container runtime — native lightweight-VM containers on macOS (Tahoe), no Podman VM needed
+- **New:** Auto-detect runtime — uses Apple container on macOS, Podman on Linux
+- **New:** Runtime-agnostic helper layer — all container operations route through `rt_*` functions
+- Rename project to SearXNG-Local
+- Rewrite README for dual-runtime setup
+
 ## [0.5.1] — 2026-09-05
 
 - Update README to document parallel probing, instant startup, country labels, and JSON API endpoints

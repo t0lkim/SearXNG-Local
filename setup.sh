@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # searxng-local setup
-# Creates a local SearXNG instance using Podman with persistent configuration.
+# Creates a local SearXNG instance using Apple's container CLI (macOS)
+# or Podman (GNU/Linux), with persistent configuration.
 
 CONTAINER_NAME="searxng"
 VOLUME_NAME="searxng-data"
@@ -32,20 +33,211 @@ validate_port() {
   fi
 }
 
-check_podman() {
-  command -v podman >/dev/null 2>&1 || error "podman not found. Install it first:
-  macOS:   brew install podman && podman machine init && podman machine start
-  Linux:   https://podman.io/docs/installation"
-}
+# --- Runtime detection ---
 
-check_podman_running() {
-  if [[ "$(uname)" == "Darwin" ]]; then
-    if ! podman machine info --format '{{.Host.MachineState}}' 2>/dev/null | grep -qi running; then
-      info "Starting Podman machine..."
-      podman machine start || error "Failed to start Podman machine. Run: podman machine init && podman machine start"
+RUNTIME=""
+
+detect_runtime() {
+  if [[ "$(uname)" == "Darwin" ]] && command -v container >/dev/null 2>&1; then
+    RUNTIME="container"
+  elif command -v podman >/dev/null 2>&1; then
+    RUNTIME="podman"
+  else
+    if [[ "$(uname)" == "Darwin" ]]; then
+      error "No container runtime found. Install one:
+  Apple container: brew install container
+  Podman:          brew install podman"
+    else
+      error "podman not found. Install it:
+  Debian/Ubuntu: sudo apt install podman
+  Fedora/RHEL:   sudo dnf install podman"
     fi
   fi
 }
+
+ensure_runtime_running() {
+  case "$RUNTIME" in
+    container)
+      if ! container list >/dev/null 2>&1; then
+        info "Starting container system service..."
+        brew services start container 2>/dev/null \
+          || container system start \
+          || error "Failed to start container service. Run: brew services start container"
+      fi
+      ;;
+    podman)
+      if [[ "$(uname)" == "Darwin" ]]; then
+        if ! podman machine info --format '{{.Host.MachineState}}' 2>/dev/null | grep -qi running; then
+          info "Starting Podman machine..."
+          podman machine start || error "Failed to start Podman machine. Run: podman machine init && podman machine start"
+        fi
+      fi
+      ;;
+  esac
+}
+
+# --- Runtime-agnostic helpers ---
+
+rt_container_exists() {
+  case "$RUNTIME" in
+    container) container list -a -q 2>/dev/null | grep -qx "$CONTAINER_NAME" ;;
+    podman)    podman container exists "$CONTAINER_NAME" 2>/dev/null ;;
+  esac
+}
+
+rt_container_state() {
+  case "$RUNTIME" in
+    container)
+      container inspect "$CONTAINER_NAME" 2>/dev/null \
+        | sed -n 's/.*"state" *: *"\([^"]*\)".*/\1/p' | head -1
+      ;;
+    podman)
+      podman container inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "unknown"
+      ;;
+  esac
+}
+
+rt_start() {
+  case "$RUNTIME" in
+    container) container start "$CONTAINER_NAME" ;;
+    podman)    podman start "$CONTAINER_NAME" ;;
+  esac
+}
+
+rt_stop() {
+  case "$RUNTIME" in
+    container) container stop "$CONTAINER_NAME" ;;
+    podman)    podman stop "$CONTAINER_NAME" ;;
+  esac
+}
+
+rt_delete() {
+  case "$RUNTIME" in
+    container) container delete -f "$CONTAINER_NAME" ;;
+    podman)    podman rm "$CONTAINER_NAME" ;;
+  esac
+}
+
+rt_volume_create() {
+  case "$RUNTIME" in
+    container) container volume create "$VOLUME_NAME" 2>/dev/null || true ;;
+    podman)    podman volume create "$VOLUME_NAME" 2>/dev/null || true ;;
+  esac
+}
+
+rt_volume_exists() {
+  case "$RUNTIME" in
+    container) container volume list --format json 2>/dev/null | grep -q "\"$VOLUME_NAME\"" ;;
+    podman)    podman volume exists "$VOLUME_NAME" 2>/dev/null ;;
+  esac
+}
+
+rt_volume_delete() {
+  case "$RUNTIME" in
+    container) container volume delete "$VOLUME_NAME" ;;
+    podman)    podman volume rm "$VOLUME_NAME" ;;
+  esac
+}
+
+rt_pull() {
+  case "$RUNTIME" in
+    container) container image pull "$IMAGE" ;;
+    podman)    podman pull "$IMAGE" ;;
+  esac
+}
+
+rt_image_id() {
+  case "$RUNTIME" in
+    container)
+      container image list --format json 2>/dev/null \
+        | sed -n 's/.*"digest" *: *"\([^"]*\)".*searxng.*/\1/p' | head -1
+      ;;
+    podman)
+      podman image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null
+      ;;
+  esac
+}
+
+rt_current_image_id() {
+  case "$RUNTIME" in
+    container)
+      container inspect "$CONTAINER_NAME" 2>/dev/null \
+        | sed -n 's/.*"digest" *: *"\([^"]*\)".*/\1/p' | head -1
+      ;;
+    podman)
+      podman container inspect --format '{{.Image}}' "$CONTAINER_NAME" 2>/dev/null
+      ;;
+  esac
+}
+
+rt_create_seed() {
+  case "$RUNTIME" in
+    container)
+      # Apple container cp requires a running container, so run with sleep
+      container run -d --name searxng-seed -v "${VOLUME_NAME}:/etc/searxng" "$IMAGE" sleep 120 2>/dev/null | tail -1
+      ;;
+    podman)
+      podman create --name searxng-seed -v "${VOLUME_NAME}:/etc/searxng" "$IMAGE" true
+      ;;
+  esac
+}
+
+rt_cp() {
+  case "$RUNTIME" in
+    container) container copy "$1" "$2" ;;
+    podman)    podman cp "$1" "$2" ;;
+  esac
+}
+
+rt_delete_seed() {
+  case "$RUNTIME" in
+    container)
+      container stop searxng-seed 2>/dev/null || true
+      container delete searxng-seed 2>/dev/null || true
+      ;;
+    podman)
+      podman rm searxng-seed >/dev/null
+      ;;
+  esac
+}
+
+rt_run() {
+  case "$RUNTIME" in
+    container)
+      container run -d \
+        --name "$CONTAINER_NAME" \
+        -p "${BIND}:${INTERNAL_PORT}:8080" \
+        -v "${VOLUME_NAME}:/etc/searxng" \
+        -e "SEARXNG_BASE_URL=${BASE_URL}" \
+        "$IMAGE"
+      ;;
+    podman)
+      podman run -d \
+        --name "$CONTAINER_NAME" \
+        --restart always \
+        -p "${BIND}:${INTERNAL_PORT}:8080" \
+        -v "${VOLUME_NAME}:/etc/searxng" \
+        -e "SEARXNG_BASE_URL=${BASE_URL}" \
+        "$IMAGE"
+      ;;
+  esac
+}
+
+rt_exec() {
+  case "$RUNTIME" in
+    container) container exec "$@" ;;
+    podman)    podman exec "$@" ;;
+  esac
+}
+
+rt_logs() {
+  case "$RUNTIME" in
+    container) container logs "$@" "$CONTAINER_NAME" ;;
+    podman)    podman logs "$@" "$CONTAINER_NAME" ;;
+  esac
+}
+
+# --- Core functions ---
 
 generate_secret_key() {
   if command -v openssl >/dev/null 2>&1; then
@@ -84,66 +276,61 @@ EOF
 
 setup() {
   validate_port
-  check_podman
-  check_podman_running
+  detect_runtime
+  ensure_runtime_running
 
-  if podman container exists "$CONTAINER_NAME" 2>/dev/null; then
+  info "Using runtime: ${RUNTIME}"
+
+  if rt_container_exists; then
     local state
-    state="$(podman container inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "unknown")"
+    state="$(rt_container_state)"
     if [[ "$state" == "running" ]]; then
       info "SearXNG is already running at ${BASE_URL}"
       start_proxy_watch
       return 0
     fi
     info "Starting existing container..."
-    podman start "$CONTAINER_NAME"
+    rt_start
     info "SearXNG running at ${BASE_URL}"
     start_proxy_watch
     return 0
   fi
 
   info "Creating volume ${VOLUME_NAME}..."
-  podman volume create "$VOLUME_NAME" 2>/dev/null || true
+  rt_volume_create
 
   info "Pulling ${IMAGE}..."
-  podman pull "$IMAGE"
+  rt_pull
 
   # Seed settings into the volume via a temporary container.
-  # Works on both macOS (volume inside VM) and Linux.
   local seed_cid
-  seed_cid="$(podman create --name searxng-seed -v "${VOLUME_NAME}:/etc/searxng" "$IMAGE" true)"
+  seed_cid="$(rt_create_seed)"
 
-  # Only write settings if the volume doesn't already have them.
   local tmpdir
   tmpdir="$(mktemp -d)"
-  if podman cp "${seed_cid}:/etc/searxng/settings.yml" "${tmpdir}/existing.yml" 2>/dev/null; then
+  if rt_cp "searxng-seed:/etc/searxng/settings.yml" "${tmpdir}/existing.yml" 2>/dev/null; then
     info "Using existing settings from volume."
   else
     create_settings "${tmpdir}/settings.yml"
-    podman cp "${tmpdir}/settings.yml" "${seed_cid}:/etc/searxng/settings.yml"
+    rt_cp "${tmpdir}/settings.yml" "searxng-seed:/etc/searxng/settings.yml"
   fi
   rm -rf "$tmpdir"
 
-  podman rm "$seed_cid" >/dev/null
+  rt_delete_seed
 
   info "Starting SearXNG..."
-  podman run -d \
-    --name "$CONTAINER_NAME" \
-    --restart always \
-    -p "${BIND}:${INTERNAL_PORT}:8080" \
-    -v "${VOLUME_NAME}:/etc/searxng" \
-    -e "SEARXNG_BASE_URL=${BASE_URL}" \
-    "$IMAGE"
+  rt_run
 
   info "SearXNG running at ${BASE_URL}"
   start_proxy_watch
 }
 
 stop() {
+  detect_runtime
   stop_proxy_watch
-  if podman container exists "$CONTAINER_NAME" 2>/dev/null; then
+  if rt_container_exists; then
     info "Stopping SearXNG..."
-    podman stop "$CONTAINER_NAME"
+    rt_stop
     info "Stopped."
   else
     info "No SearXNG container found."
@@ -151,39 +338,48 @@ stop() {
 }
 
 teardown() {
+  detect_runtime
   stop_proxy_watch
   stop 2>/dev/null || true
-  if podman container exists "$CONTAINER_NAME" 2>/dev/null; then
+  if rt_container_exists; then
     info "Removing container..."
-    podman rm "$CONTAINER_NAME"
+    rt_delete
   fi
   info "Volume ${VOLUME_NAME} preserved (contains your settings)."
-  info "To remove everything: podman volume rm ${VOLUME_NAME}"
+  info "To remove everything: ${RUNTIME} volume $([ "$RUNTIME" = "container" ] && echo "delete" || echo "rm") ${VOLUME_NAME}"
 }
 
 status() {
-  if podman container exists "$CONTAINER_NAME" 2>/dev/null; then
-    echo "Name:    $(podman container inspect --format '{{.Name}}' "$CONTAINER_NAME")"
-    echo "Image:   $(podman container inspect --format '{{.ImageName}}' "$CONTAINER_NAME")"
-    echo "Status:  $(podman container inspect --format '{{.State.Status}}' "$CONTAINER_NAME")"
-    echo "Started: $(podman container inspect --format '{{.State.StartedAt}}' "$CONTAINER_NAME")"
-    echo "Port:    $(podman port "$CONTAINER_NAME" 2>/dev/null | head -1 || echo "none")"
+  detect_runtime
+  if rt_container_exists; then
+    local state
+    state="$(rt_container_state)"
+    echo "Runtime: ${RUNTIME}"
+    echo "Name:    ${CONTAINER_NAME}"
+    echo "Image:   ${IMAGE}"
+    echo "Status:  ${state}"
+    if [[ "$RUNTIME" == "container" ]]; then
+      echo "Port:    ${BIND}:${INTERNAL_PORT} -> 8080"
+    else
+      echo "Port:    $(podman port "$CONTAINER_NAME" 2>/dev/null | head -1 || echo "none")"
+    fi
   else
     info "No SearXNG container found."
   fi
 }
 
 update() {
-  if ! podman container exists "$CONTAINER_NAME" 2>/dev/null; then
+  detect_runtime
+  if ! rt_container_exists; then
     error "No SearXNG container found. Run './setup.sh' first."
   fi
 
   info "Pulling latest ${IMAGE}..."
   local old_id
-  old_id="$(podman container inspect --format '{{.Image}}' "$CONTAINER_NAME" 2>/dev/null)"
-  podman pull "$IMAGE"
+  old_id="$(rt_current_image_id)"
+  rt_pull
   local new_id
-  new_id="$(podman image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null)"
+  new_id="$(rt_image_id)"
 
   if [[ "$old_id" == "$new_id" ]]; then
     info "Already running the latest image."
@@ -191,29 +387,29 @@ update() {
   fi
 
   info "New image available. Recreating container..."
-  podman stop "$CONTAINER_NAME" 2>/dev/null || true
-  podman rm "$CONTAINER_NAME"
+  rt_stop 2>/dev/null || true
+  rt_delete
 
-  podman run -d \
-    --name "$CONTAINER_NAME" \
-    --restart always \
-    -p "${BIND}:${INTERNAL_PORT}:8080" \
-    -v "${VOLUME_NAME}:/etc/searxng" \
-    -e "SEARXNG_BASE_URL=${BASE_URL}" \
-    "$IMAGE"
+  rt_run
 
   info "SearXNG updated and running at ${BASE_URL}"
 }
 
 logs() {
-  if podman container exists "$CONTAINER_NAME" 2>/dev/null; then
-    podman logs "${@:---tail=50}" "$CONTAINER_NAME"
+  detect_runtime
+  if rt_container_exists; then
+    if [[ "$RUNTIME" == "container" ]]; then
+      rt_logs "${@:--n 50}"
+    else
+      rt_logs "${@:---tail=50}"
+    fi
   else
     error "No SearXNG container found."
   fi
 }
 
 reset() {
+  detect_runtime
   warn "This will destroy the container AND all settings."
   printf "Continue? [y/N] "
   read -r confirm
@@ -223,11 +419,11 @@ reset() {
   fi
 
   stop 2>/dev/null || true
-  if podman container exists "$CONTAINER_NAME" 2>/dev/null; then
-    podman rm "$CONTAINER_NAME"
+  if rt_container_exists; then
+    rt_delete
   fi
-  if podman volume exists "$VOLUME_NAME" 2>/dev/null; then
-    podman volume rm "$VOLUME_NAME"
+  if rt_volume_exists; then
+    rt_volume_delete
   fi
   info "Removed container and volume. Run './setup.sh' to start fresh."
 }
@@ -284,12 +480,16 @@ Commands:
   start     Start an existing container
   stop      Stop the container
   update    Pull latest image and recreate container (preserves settings)
-  logs      Show container logs (pass podman logs flags after)
+  logs      Show container logs (pass log flags after)
   status    Show container status
   teardown  Remove the container (preserves settings volume)
   reset     Remove container AND settings volume (destructive)
   proxy     Manage VPN proxy routing (start|stop|probe|status|watch)
   help      Show this message
+
+Runtime:
+  macOS uses Apple's container CLI (brew install container).
+  GNU/Linux uses Podman (apt/dnf install podman).
 
 Environment:
   SEARXNG_INTERNAL_PORT  Internal SearXNG port (default: 8082)

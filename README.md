@@ -1,43 +1,45 @@
-# searxng-local
+# SearXNG-Local
 
-Run [SearXNG](https://searxng.org) locally in a Podman container with self-managing proxy routing across multiple VPN exits and Tor.
+Run [SearXNG](https://searxng.org) locally using Apple's native [container](https://github.com/apple/container) runtime (macOS) or [Podman](https://podman.io) (GNU/Linux), with self-managing proxy routing across multiple VPN exits and Tor.
 
 SearXNG is a privacy-respecting metasearch engine that aggregates results from 70+ search engines without tracking you. Many engines block requests from known VPN and Tor IP ranges. The bundled proxy manager automatically routes each engine through whichever exit isn't blocking it, monitors for changes, and re-routes on the fly.
 
 ## Prerequisites
 
-- [Podman](https://podman.io/docs/installation) installed and running
+### macOS (Apple Silicon)
 
-### macOS
+[Apple container](https://github.com/apple/container) — native lightweight-VM container runtime, requires macOS 26 (Tahoe):
 
 ```bash
-brew install podman
-podman machine init
-podman machine start
+brew install container
+brew services start container
+container system kernel set --recommended
 ```
 
-### GNU/Linux (Debian/Ubuntu)
+### GNU/Linux
+
+[Podman](https://podman.io/docs/installation):
 
 ```bash
+# Debian/Ubuntu
 sudo apt install podman
-```
 
-### GNU/Linux (Fedora/RHEL)
-
-```bash
+# Fedora/RHEL
 sudo dnf install podman
 ```
 
 ## Quick start
 
 ```bash
-git clone https://github.com/t0lkim/searxng-local.git
-cd searxng-local
+git clone https://github.com/t0lkim/SearXNG-Local.git
+cd SearXNG-Local
 chmod +x setup.sh
 ./setup.sh
 ```
 
 SearXNG is now running at [http://localhost:8080](http://localhost:8080).
+
+The setup script auto-detects your container runtime (Apple container on macOS, Podman on Linux).
 
 ## Proxy routing
 
@@ -99,7 +101,7 @@ SEARXNG_BIND=0.0.0.0 ./setup.sh   # Expose to the network (default: 127.0.0.1)
 
 The setup script:
 
-1. Checks that Podman is installed and running (starts the Podman VM on macOS if needed)
+1. Detects your container runtime (Apple container on macOS, Podman on Linux)
 2. Creates a named volume (`searxng-data`) for persistent configuration
 3. Generates a unique `secret_key` and writes `settings.yml` into the volume
 4. Pulls the official SearXNG image and starts the container
@@ -108,29 +110,23 @@ On subsequent runs it starts the existing container — no duplicate containers,
 
 ## Configuration
 
-Settings persist in the `searxng-data` Podman volume. To edit:
+Settings persist in the `searxng-data` volume. To edit:
 
 ```bash
-# View current settings
+# View current settings (macOS)
+container exec searxng cat /etc/searxng/settings.yml
+
+# View current settings (Linux)
 podman exec searxng cat /etc/searxng/settings.yml
-
-# Edit in-place
-podman exec -it searxng vi /etc/searxng/settings.yml
-
-# Or copy out, edit, copy back
-podman cp searxng:/etc/searxng/settings.yml ./my-settings.yml
-# ... edit my-settings.yml ...
-podman cp ./my-settings.yml searxng:/etc/searxng/settings.yml
-podman restart searxng
 ```
 
 The bundled `settings.yml` uses SearXNG defaults with `image_proxy` enabled. See the [SearXNG settings documentation](https://docs.searxng.org/admin/settings/) for all options.
 
 ## Auto-start (optional)
 
-The container is created with `--restart always`, so it starts automatically when the Podman runtime is running. To start Podman itself at login/boot:
-
 ### macOS (launchd)
+
+With Apple container, the system service runs via `brew services start container`. The SearXNG container itself can be managed by a launchd agent.
 
 Create `~/Library/LaunchAgents/local.searxng.plist`:
 
@@ -145,7 +141,7 @@ Create `~/Library/LaunchAgents/local.searxng.plist`:
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>/path/to/searxng-local/setup.sh</string>
+    <string>/path/to/SearXNG-Local/setup.sh</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -163,8 +159,6 @@ Then load it:
 launchctl load ~/Library/LaunchAgents/local.searxng.plist
 ```
 
-The script waits for the Podman machine before starting the container.
-
 ### GNU/Linux (systemd user unit)
 
 Create `~/.config/systemd/user/searxng.service`:
@@ -176,9 +170,9 @@ After=default.target
 
 [Service]
 Type=oneshot
-ExecStart=/path/to/searxng-local/setup.sh
+ExecStart=/path/to/SearXNG-Local/setup.sh
 RemainAfterExit=yes
-ExecStop=/path/to/searxng-local/setup.sh stop
+ExecStop=/path/to/SearXNG-Local/setup.sh stop
 
 [Install]
 WantedBy=default.target
@@ -202,14 +196,16 @@ Pulls the latest SearXNG image. If it's newer than what's running, the container
 ## Uninstall
 
 ```bash
-./setup.sh reset                     # Remove container + settings (interactive)
-podman rmi docker.io/searxng/searxng # Remove image
+./setup.sh reset                       # Remove container + settings (interactive)
+container image delete searxng/searxng # macOS: remove image
+# or
+podman rmi docker.io/searxng/searxng   # Linux: remove image
 ```
 
 Or to keep your settings for later:
 
 ```bash
-./setup.sh teardown                  # Remove container only
+./setup.sh teardown                    # Remove container only
 ```
 
 ## Licence
