@@ -58,8 +58,7 @@ When `vpn-configs/` contains `.conf` files, `./setup.sh` automatically starts th
 For manual control:
 
 ```bash
-./setup.sh proxy start   # Start tunnels, probe engines, apply optimal routes
-./setup.sh proxy watch   # Continuous monitoring (foreground, re-probes every 5 min)
+./setup.sh proxy start   # Start server, tunnels, probe, monitor (foreground)
 ./setup.sh proxy status  # Show current health matrix
 ./setup.sh proxy probe   # Run a one-off health probe
 ./setup.sh proxy stop    # Stop VPN tunnels
@@ -72,7 +71,7 @@ For manual control:
 3. Picks the exit that serves the most engines as the default
 4. Routes engines that are blocked on the default to an exit where they work
 5. Applies a verification search and re-routes any engine that still fails
-6. In watch mode, checks tunnel health and engine availability every 5 minutes
+6. Monitors tunnel health and engine availability every 5 minutes, re-routing as needed
 
 The reverse proxy starts immediately - search is available while the first probe cycle runs in the background. The health matrix is saved to `.runtime/health-matrix.json` and used as a historical fallback when a current probe shows no alternative for a blocked engine.
 
