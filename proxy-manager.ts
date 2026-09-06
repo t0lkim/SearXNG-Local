@@ -828,12 +828,94 @@ async function cmdWatch() {
   }
 }
 
+// ─── Single-engine reprobe ─────────────────────────────────
+
+async function reprobeEngine(url: URL): Promise<Response> {
+  const engine = url.searchParams.get("engine");
+  if (!engine) {
+    return Response.json({ ok: false, error: "missing engine param" }, { status: 400 });
+  }
+
+  const engineUrl = ENGINE_URLS.find(([e]) => e === engine)?.[1];
+  if (!engineUrl) {
+    return Response.json({ ok: false, error: `unknown engine: ${engine}` }, { status: 400 });
+  }
+
+  const exits = await discoverExits();
+  const reachable: Exit[] = [];
+  for (const exit of exits) {
+    try {
+      execSync(`nc -z -G 2 127.0.0.1 ${exit.port}`, { stdio: "ignore", timeout: 3000 });
+      reachable.push(exit);
+    } catch { /* unreachable */ }
+  }
+
+  if (reachable.length === 0) {
+    return Response.json({ ok: false, error: "no reachable exits" });
+  }
+
+  const results = await Promise.all(
+    reachable.map(async (exit) => {
+      const result = await directProbeEngine(engine, engineUrl, exit.port);
+      return { exit: exit.name, result };
+    }),
+  );
+
+  const working = results.filter(r => r.result.status === "ok");
+  console.log(`[reprobe] ${engine}: ${working.length}/${results.length} exits ok`);
+
+  let matrix: HealthMatrix;
+  try {
+    matrix = JSON.parse(await readFile(HEALTH_FILE, "utf-8"));
+  } catch {
+    return Response.json({ ok: false, error: "no health matrix" });
+  }
+
+  // Update engine status in existing probes
+  for (const { exit, result } of results) {
+    const probe = matrix.probes.find(p => p.exit === exit);
+    if (!probe) continue;
+    const idx = probe.engines.findIndex(e => e.engine === engine);
+    if (idx >= 0) probe.engines[idx] = result;
+    else probe.engines.push(result);
+  }
+
+  const defaultExit = matrix.assignments._default ?? "tor";
+  let assignedExit: string | null = null;
+
+  if (working.length > 0) {
+    const defaultWorks = working.some(w => w.exit === defaultExit);
+    if (defaultWorks) {
+      delete matrix.assignments[engine];
+      assignedExit = defaultExit;
+    } else {
+      matrix.assignments[engine] = working[0].exit;
+      assignedExit = working[0].exit;
+    }
+
+    const secretKey = await getSecretKey();
+    const { _default, ...engineAssignments } = matrix.assignments;
+    const yaml = settingsOptimal(secretKey, exits, engineAssignments, defaultExit);
+    await applySettings(yaml);
+    await waitForReady();
+  }
+
+  matrix.timestamp = new Date().toISOString();
+  await writeFile(HEALTH_FILE, JSON.stringify(matrix, null, 2));
+
+  if (working.length === 0) {
+    return Response.json({ ok: false, error: `${engine}: no working exit found` });
+  }
+  return Response.json({ ok: true, engine, exit: assignedExit });
+}
+
 // ─── Status dashboard ──────────────────────────────────────
 
 function startStatusServer() {
   Bun.serve({
     port: PROXY_PORT,
     hostname: "127.0.0.1",
+    idleTimeout: 255,
     async fetch(req) {
       const url = new URL(req.url);
 
@@ -845,6 +927,9 @@ function startStatusServer() {
       }
       if (url.pathname === "/api/log") {
         return statusLog(url);
+      }
+      if (url.pathname === "/api/reprobe" && req.method === "POST") {
+        return reprobeEngine(url);
       }
 
       // Reverse-proxy everything else to SearXNG
@@ -985,6 +1070,9 @@ async function statusPage(): Promise<Response> {
   .tag.default { background: rgba(88,166,255,0.15); color: var(--accent); }
   .tag.routed { background: rgba(63,185,80,0.15); color: var(--ok); }
   .tag.blocked { background: rgba(248,81,73,0.15); color: var(--bad); }
+  .reprobe-btn { background: rgba(88,166,255,0.15); color: var(--accent); border: 1px solid var(--accent); border-radius: 4px; padding: 0.15rem 0.5rem; font-size: 0.75rem; cursor: pointer; white-space: nowrap; }
+  .reprobe-btn:hover { background: rgba(88,166,255,0.3); }
+  .reprobe-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .health-grid { overflow-x: auto; }
   .health-grid table { min-width: 600px; }
   .health-grid td, .health-grid th { text-align: center; padding: 0.3rem 0.4rem; font-size: 0.78rem; white-space: nowrap; }
@@ -1000,7 +1088,7 @@ async function statusPage(): Promise<Response> {
   <div class="card">
     <h2>Engine Routing</h2>
     <table>
-      <tr><th>Engine</th><th>Exit</th><th>Status</th></tr>
+      <tr><th>Engine</th><th>Exit</th><th>Status</th><th></th></tr>
       ${engines.map(eng => {
         const route = assignments[eng] ?? defaultExit;
         const isCustom = eng in assignments && eng !== "_default";
@@ -1008,7 +1096,8 @@ async function statusPage(): Promise<Response> {
         const status = probe?.status ?? "unknown";
         const statusClass = status === "ok" ? "ok" : status === "timeout" ? "warn" : status === "unknown" ? "muted" : "bad";
         const tagClass = isCustom ? "routed" : "default";
-        return `<tr><td>${eng}</td><td><span class="tag ${tagClass}">${route}</span></td><td class="${statusClass}">${status}</td></tr>`;
+        const btn = status !== "ok" ? `<button class="reprobe-btn" onclick="reprobe('${eng}', this)">reprobe</button>` : "";
+        return `<tr><td>${eng}</td><td><span class="tag ${tagClass}">${route}</span></td><td class="${statusClass}">${status}</td><td>${btn}</td></tr>`;
       }).join("\n      ")}
     </table>
   </div>
@@ -1054,6 +1143,24 @@ async function refreshLog() {
     el.textContent = text;
     el.scrollTop = el.scrollHeight;
   } catch {}
+}
+async function reprobe(engine, btn) {
+  btn.disabled = true;
+  btn.textContent = "probing…";
+  try {
+    const res = await fetch("/api/reprobe?engine=" + encodeURIComponent(engine), { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      btn.textContent = data.exit ? ("✓ " + data.exit) : "✓ done";
+      setTimeout(() => location.reload(), 1500);
+    } else {
+      btn.textContent = data.error || "failed";
+      setTimeout(() => { btn.textContent = "reprobe"; btn.disabled = false; }, 3000);
+    }
+  } catch {
+    btn.textContent = "error";
+    setTimeout(() => { btn.textContent = "reprobe"; btn.disabled = false; }, 3000);
+  }
 }
 refreshLog();
 setInterval(refreshLog, 10000);
