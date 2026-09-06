@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.7.1] - 2026-09-06
+
+- Dashboard engine table now shows only engines with issues (blocked/error/timeout/unknown); "All engines routing OK" when everything is healthy
+
 ## [0.7.0] - 2026-09-06
 
 - **New:** Reprobe button on the dashboard - blocked/error/timeout engines get a one-click reprobe that tests all exits and re-routes if an alternative is found

@@ -1086,19 +1086,22 @@ async function statusPage(): Promise<Response> {
 
 <div class="grid">
   <div class="card">
-    <h2>Engine Routing</h2>
+    <h2>Engine Issues</h2>
     <table>
       <tr><th>Engine</th><th>Exit</th><th>Status</th><th></th></tr>
-      ${engines.map(eng => {
+      ${engines.filter(eng => {
+        const route = assignments[eng] ?? defaultExit;
+        const probe = lookup.get(route)?.get(eng);
+        return probe?.status !== "ok";
+      }).map(eng => {
         const route = assignments[eng] ?? defaultExit;
         const isCustom = eng in assignments && eng !== "_default";
         const probe = lookup.get(route)?.get(eng);
         const status = probe?.status ?? "unknown";
-        const statusClass = status === "ok" ? "ok" : status === "timeout" ? "warn" : status === "unknown" ? "muted" : "bad";
+        const statusClass = status === "timeout" ? "warn" : status === "unknown" ? "muted" : "bad";
         const tagClass = isCustom ? "routed" : "default";
-        const btn = status !== "ok" ? `<button class="reprobe-btn" onclick="reprobe('${eng}', this)">reprobe</button>` : "";
-        return `<tr><td>${eng}</td><td><span class="tag ${tagClass}">${route}</span></td><td class="${statusClass}">${status}</td><td>${btn}</td></tr>`;
-      }).join("\n      ")}
+        return `<tr><td>${eng}</td><td><span class="tag ${tagClass}">${route}</span></td><td class="${statusClass}">${status}</td><td><button class="reprobe-btn" onclick="reprobe('${eng}', this)">reprobe</button></td></tr>`;
+      }).join("\n      ") || '<tr><td colspan="4" class="ok">All engines routing OK</td></tr>'}
     </table>
   </div>
 
