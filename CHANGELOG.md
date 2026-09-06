@@ -6,6 +6,7 @@
 - **New:** `/api/reprobe?engine=<name>` POST endpoint for programmatic single-engine reprobing
 - Increase server idle timeout to 255s (prevents reprobe timeouts on slow exits)
 - Use GNU/Linux consistently in README (was bare "Linux" in places)
+- Fix unused variable warning in setup.sh (shellcheck clean)
 
 ## [0.6.0] - 2026-09-06
 

@@ -303,8 +303,7 @@ setup() {
   rt_pull
 
   # Seed settings into the volume via a temporary container.
-  local seed_cid
-  seed_cid="$(rt_create_seed)"
+  rt_create_seed >/dev/null
 
   local tmpdir
   tmpdir="$(mktemp -d)"
