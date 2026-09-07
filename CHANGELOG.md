@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.8.5] - 2026-09-07
+
+- **Fix:** Monitor loop no longer stalls on SearXNG rate limiter - liveness check uses `/config` instead of `/search` (which triggered 403 indefinitely, preventing all probe updates)
+- **New:** Forced full probe every 30 minutes regardless of liveness check result, so the health matrix can never go stale
+
 ## [0.8.4] - 2026-09-06
 
 - **Fix:** False-positive CAPTCHA detection on GMX - tighten pattern matching from bare keywords (`recaptcha`, `hcaptcha`, `captcha`) to specific integration markers (`g-recaptcha`, `recaptcha/api`, `hcaptcha.com`) so that template CSS/JS containing those words no longer triggers a false block

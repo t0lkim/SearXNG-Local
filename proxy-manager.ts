@@ -4,7 +4,7 @@ import { readdir, readFile, writeFile, mkdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
 
-const VERSION = "0.8.4";
+const VERSION = "0.8.5";
 const ROOT = import.meta.dir;
 const VPN_DIR = join(ROOT, "vpn-configs");
 const RUNTIME_DIR = join(ROOT, ".runtime");
@@ -18,6 +18,7 @@ const WP_BIN = join(process.env.HOME!, "go", "bin", "wireproxy");
 const PROBE_TIMEOUT = 15_000;
 const READY_TIMEOUT = 20_000;
 const MONITOR_INTERVAL = 300_000;
+const FORCED_PROBE_INTERVAL = 1_800_000;
 const PROXY_PORT = 8080;
 const TOR_CONTROL_PORT = 9051;
 const TOR_CONTROL_PASS = "searxng-local";
@@ -648,7 +649,8 @@ async function cmdStart() {
   await initialProbeAndRoute(activeExits);
 
   let knownExits = await discoverExits();
-  console.log(`Monitoring every ${MONITOR_INTERVAL / 1000}s... (Ctrl-C to stop)\n`);
+  let lastFullProbe = Date.now();
+  console.log(`Monitoring every ${MONITOR_INTERVAL / 1000}s (forced probe every ${FORCED_PROBE_INTERVAL / 60_000}m)... (Ctrl-C to stop)\n`);
 
   while (true) {
     await Bun.sleep(MONITOR_INTERVAL);
@@ -666,6 +668,7 @@ async function cmdStart() {
       knownExits = freshExits;
       console.log(`[${ts}] re-probing after config change`);
       await cmdProbe();
+      lastFullProbe = Date.now();
       continue;
     }
     knownExits = freshExits;
@@ -675,30 +678,31 @@ async function cmdStart() {
     if (revived > 0) {
       console.log(` ${revived} tunnel(s) restarted - re-probing`);
       await cmdProbe();
+      lastFullProbe = Date.now();
       continue;
     }
     console.log(" tunnels ok");
 
+    const sinceLast = Date.now() - lastFullProbe;
+    if (sinceLast >= FORCED_PROBE_INTERVAL) {
+      console.log(`[${ts}] forced probe (${Math.round(sinceLast / 60_000)}m since last)`);
+      await cmdProbe();
+      lastFullProbe = Date.now();
+      continue;
+    }
+
     process.stdout.write(`[${ts}] engine check...`);
     try {
-      const res = await fetch(`${SEARXNG_URL}/search?q=test&format=json`, {
+      const res = await fetch(`${SEARXNG_URL}/config`, {
         signal: AbortSignal.timeout(PROBE_TIMEOUT),
       });
       if (!res.ok) {
-        console.log(` ⚠ HTTP ${res.status} (rate limited) - skipping`);
+        console.log(` ⚠ SearXNG HTTP ${res.status}`);
         continue;
       }
-      const data = (await res.json()) as { unresponsive_engines?: [string, string][] };
-      const bad = data.unresponsive_engines ?? [];
-      if (bad.length > 0) {
-        console.log(` ⚠ ${bad.length} down - re-probing`);
-        await cmdProbe();
-      } else {
-        console.log(" ✓ all healthy");
-      }
+      console.log(" ✓ SearXNG alive");
     } catch (err: unknown) {
-      console.log(` ✗ ${err instanceof Error ? err.message : err} - re-probing`);
-      await cmdProbe();
+      console.log(` ✗ ${err instanceof Error ? err.message : err}`);
     }
   }
 }
