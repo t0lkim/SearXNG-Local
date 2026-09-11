@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.9.0] - 2026-09-11
+
+- **New:** macOS LaunchAgent support - `./setup.sh install-agent` generates and installs a LaunchAgent so SearXNG starts automatically on login; `./setup.sh uninstall-agent` to remove
+- **New:** `searxng-start.sh` launcher script for LaunchAgent use
+- **Fix:** LaunchAgent now uses Apple `container` CLI (was incorrectly hardcoded to Podman)
+
 ## [0.8.5] - 2026-09-07
 
 - **Fix:** Monitor loop no longer stalls on SearXNG rate limiter - liveness check uses `/config` instead of `/search` (which triggered 403 indefinitely, preventing all probe updates)

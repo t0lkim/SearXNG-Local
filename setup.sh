@@ -486,22 +486,73 @@ proxy() {
   exec bun "${SCRIPT_DIR}/proxy-manager.ts" "$subcmd"
 }
 
+LAUNCHD_LABEL="dev.t0lkim.searxng"
+PLIST_TEMPLATE="${SCRIPT_DIR}/dev.t0lkim.searxng.plist.template"
+LAUNCHD_DIR="${HOME}/Library/LaunchAgents"
+
+install_agent() {
+  if [[ "$(uname)" != "Darwin" ]]; then
+    error "LaunchAgent install is macOS only."
+  fi
+  if [[ ! -f "$PLIST_TEMPLATE" ]]; then
+    error "Plist template not found: $PLIST_TEMPLATE"
+  fi
+
+  local plist="${LAUNCHD_DIR}/${LAUNCHD_LABEL}.plist"
+
+  if [[ -f "$plist" ]] || [[ -L "$plist" ]]; then
+    launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || true
+    rm -f "$plist"
+  fi
+
+  local generated="${SCRIPT_DIR}/${LAUNCHD_LABEL}.plist"
+  sed -e "s|__INSTALL_DIR__|${SCRIPT_DIR}|g" \
+      -e "s|__HOME__|${HOME}|g" \
+      "$PLIST_TEMPLATE" > "$generated"
+
+  ln -sf "$generated" "$plist"
+  launchctl bootstrap "gui/$(id -u)" "$plist"
+  info "LaunchAgent installed and loaded: $plist"
+  info "SearXNG will start automatically on login."
+}
+
+uninstall_agent() {
+  if [[ "$(uname)" != "Darwin" ]]; then
+    error "LaunchAgent uninstall is macOS only."
+  fi
+
+  local plist="${LAUNCHD_DIR}/${LAUNCHD_LABEL}.plist"
+
+  if [[ -f "$plist" ]] || [[ -L "$plist" ]]; then
+    launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || true
+    rm -f "$plist"
+    info "LaunchAgent uninstalled."
+  else
+    info "No LaunchAgent found."
+  fi
+
+  local generated="${SCRIPT_DIR}/${LAUNCHD_LABEL}.plist"
+  rm -f "$generated"
+}
+
 usage() {
   cat <<EOF
 Usage: $(basename "$0") [command]
 
 Commands:
-  setup     Create and start SearXNG (default)
-  start     Start an existing container
-  stop      Stop the container
-  restart   Stop and start everything
-  update    Pull latest image and recreate container (preserves settings)
-  logs      Show container logs (pass log flags after)
-  status    Show container status
-  teardown  Remove the container (preserves settings volume)
-  reset     Remove container AND settings volume (destructive)
-  proxy     Manage VPN proxy routing (start|stop|probe|status)
-  help      Show this message
+  setup            Create and start SearXNG (default)
+  start            Start an existing container
+  stop             Stop the container
+  restart          Stop and start everything
+  update           Pull latest image and recreate container (preserves settings)
+  logs             Show container logs (pass log flags after)
+  status           Show container status
+  teardown         Remove the container (preserves settings volume)
+  reset            Remove container AND settings volume (destructive)
+  proxy            Manage VPN proxy routing (start|stop|probe|status)
+  install-agent    Install macOS LaunchAgent (auto-start on login)
+  uninstall-agent  Remove macOS LaunchAgent
+  help             Show this message
 
 Runtime:
   macOS uses Apple's container CLI (brew install container).
@@ -530,6 +581,8 @@ case "${1:-setup}" in
   reset)    reset ;;
   status)   status ;;
   proxy)    shift; proxy "$@" ;;
+  install-agent)   install_agent ;;
+  uninstall-agent) uninstall_agent ;;
   help|-h|--help) usage ;;
   *) error "Unknown command: $1. Run '$(basename "$0") help' for usage." ;;
 esac

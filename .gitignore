@@ -8,3 +8,6 @@ vpn-configs/
 
 # Runtime-generated wireproxy configs contain private keys
 .runtime/
+
+# Generated plist (contains user-specific paths)
+dev.t0lkim.searxng.plist
