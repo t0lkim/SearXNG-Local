@@ -4,7 +4,31 @@ import { readdir, readFile, writeFile, mkdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
 
-const VERSION = "0.8.5";
+const VERSION = "0.9.1";
+
+async function execAsync(cmd: string, timeout = 30_000): Promise<string> {
+  const proc = Bun.spawn(["sh", "-c", cmd], { stdout: "pipe", stderr: "pipe" });
+  const result = await Promise.race([
+    proc.exited,
+    Bun.sleep(timeout).then(() => "timeout" as const),
+  ]);
+  if (result === "timeout") {
+    proc.kill();
+    throw new Error(`Command timed out after ${timeout}ms: ${cmd}`);
+  }
+  const stdout = await new Response(proc.stdout).text();
+  if (result !== 0) throw new Error(`Command failed (exit ${result}): ${cmd}`);
+  return stdout.trim();
+}
+
+async function checkPort(port: number): Promise<boolean> {
+  try {
+    const proc = Bun.spawn(["nc", "-z", "-G", "2", "127.0.0.1", String(port)], {
+      stdout: "ignore", stderr: "ignore",
+    });
+    return (await proc.exited) === 0;
+  } catch { return false; }
+}
 const ROOT = import.meta.dir;
 const VPN_DIR = join(ROOT, "vpn-configs");
 const RUNTIME_DIR = join(ROOT, ".runtime");
@@ -287,31 +311,33 @@ async function waitForHandshake(proc: Subprocess, timeout: number): Promise<bool
 }
 
 async function restartDeadTunnels(exits: Exit[]): Promise<number> {
-  let restarted = 0;
-  for (const exit of exits) {
-    if (exit.type !== "vpn" || !exit.configFile) continue;
-    try {
-      execSync(`nc -z -G 2 127.0.0.1 ${exit.port}`, { stdio: "ignore", timeout: 3000 });
-    } catch {
-      console.log(`  ⚠ ${exit.name} dead - restarting...`);
-      const old = processes.get(exit.name);
-      if (old) { try { old.kill(); } catch { /* already dead */ } }
-      processes.delete(exit.name);
+  const vpnExits = exits.filter(e => e.type === "vpn" && e.configFile);
+  const checks = await Promise.all(vpnExits.map(async (exit) => ({
+    exit,
+    alive: await checkPort(exit.port),
+  })));
 
-      const wpConf = join(RUNTIME_DIR, `wp-${exit.name}.conf`);
-      try { await readFile(wpConf); } catch {
-        const wg = await readFile(exit.configFile!, "utf-8");
-        await writeFile(wpConf, wgToWireproxyConfig(wg, exit.port));
-      }
-      const proc = Bun.spawn([WP_BIN, "-c", wpConf], { stdout: "ignore", stderr: "pipe" });
-      if (await waitForHandshake(proc, 10_000)) {
-        processes.set(exit.name, proc);
-        console.log(`  ✓ ${exit.name} back up`);
-        restarted++;
-      } else {
-        proc.kill();
-        console.log(`  ✗ ${exit.name} failed to reconnect`);
-      }
+  let restarted = 0;
+  for (const { exit, alive } of checks) {
+    if (alive) continue;
+    console.log(`  ⚠ ${exit.name} dead - restarting...`);
+    const old = processes.get(exit.name);
+    if (old) { try { old.kill(); } catch { /* already dead */ } }
+    processes.delete(exit.name);
+
+    const wpConf = join(RUNTIME_DIR, `wp-${exit.name}.conf`);
+    try { await readFile(wpConf); } catch {
+      const wg = await readFile(exit.configFile!, "utf-8");
+      await writeFile(wpConf, wgToWireproxyConfig(wg, exit.port));
+    }
+    const proc = Bun.spawn([WP_BIN, "-c", wpConf], { stdout: "ignore", stderr: "pipe" });
+    if (await waitForHandshake(proc, 10_000)) {
+      processes.set(exit.name, proc);
+      console.log(`  ✓ ${exit.name} back up`);
+      restarted++;
+    } else {
+      proc.kill();
+      console.log(`  ✗ ${exit.name} failed to reconnect`);
     }
   }
   return restarted;
@@ -329,27 +355,33 @@ async function stopProxies(): Promise<void> {
 // ─── Container management ───────────────────────────────────
 
 async function getSecretKey(): Promise<string> {
+  // Try local runtime copy first (avoids container exec which can hang)
+  try {
+    const local = await readFile(join(RUNTIME_DIR, "settings-live.yml"), "utf-8");
+    const match = local.match(/secret_key:\s*"([^"]+)"/);
+    if (match) return match[1];
+  } catch { /* no local copy yet */ }
   try {
     const execCmd = CONTAINER_RUNTIME === "container" ? "container exec" : "podman exec";
-    const out = execSync(
+    const out = await execAsync(
       `${execCmd} ${CONTAINER_NAME} grep secret_key /etc/searxng/settings.yml 2>/dev/null`,
-      { encoding: "utf-8" },
-    ).trim();
+      10_000,
+    );
     const match = out.match(/secret_key:\s*"([^"]+)"/);
     if (match) return match[1];
-  } catch { /* container not running or no settings */ }
-  return execSync("openssl rand -hex 16", { encoding: "utf-8" }).trim();
+  } catch { /* container exec failed or timed out */ }
+  return await execAsync("openssl rand -hex 16");
 }
 
 async function applySettings(yaml: string): Promise<void> {
   const tmp = join(RUNTIME_DIR, "settings-live.yml");
   await writeFile(tmp, yaml);
   const cpCmd = CONTAINER_RUNTIME === "container" ? "container copy" : "podman cp";
-  execSync(`${cpCmd} "${tmp}" ${CONTAINER_NAME}:/etc/searxng/settings.yml`);
+  await execAsync(`${cpCmd} "${tmp}" ${CONTAINER_NAME}:/etc/searxng/settings.yml`);
   const restartCmd = CONTAINER_RUNTIME === "container"
     ? `container stop ${CONTAINER_NAME} && container start ${CONTAINER_NAME}`
     : `podman restart ${CONTAINER_NAME}`;
-  execSync(restartCmd, { stdio: "ignore" });
+  await execAsync(restartCmd);
 }
 
 async function waitForReady(timeout = READY_TIMEOUT): Promise<boolean> {
@@ -547,11 +579,15 @@ async function initialProbeAndRoute(activeExits: Exit[]) {
 
   console.log("\nApplying optimal routes...");
   const yaml = settingsOptimal(secretKey, activeExits, assignments, defaultExit);
-  await applySettings(yaml);
-  if (await waitForReady()) {
-    console.log("✓ SearXNG running with optimal proxy routes\n");
-  } else {
-    console.log("⚠ SearXNG may not have started correctly\n");
+  try {
+    await applySettings(yaml);
+    if (await waitForReady()) {
+      console.log("✓ SearXNG running with optimal proxy routes\n");
+    } else {
+      console.log("⚠ SearXNG may not have started correctly\n");
+    }
+  } catch (e: any) {
+    console.log(`⚠ Could not push routes to container (${e.message}) - proxy routing still active\n`);
   }
 
   // Verify and re-route engines that fail on the default
@@ -633,10 +669,9 @@ async function cmdStart() {
 
   // Check Tor
   console.log("Checking Tor...");
-  try {
-    execSync(`nc -z -G 2 127.0.0.1 ${TOR_PORT}`, { stdio: "ignore", timeout: 3000 });
+  if (await checkPort(TOR_PORT)) {
     console.log(`  ✓ Tor SOCKS5 on port ${TOR_PORT}\n`);
-  } catch {
+  } else {
     console.log("  ⚠ Tor not running - start it: brew services start tor\n");
   }
 
@@ -715,15 +750,13 @@ async function cmdStop() {
 
 async function cmdProbe() {
   const exits = await discoverExits();
-  const reachable: Exit[] = [];
-
-  for (const exit of exits) {
-    try {
-      execSync(`nc -z -G 2 127.0.0.1 ${exit.port}`, { stdio: "ignore", timeout: 3000 });
-      reachable.push(exit);
-    } catch {
-      console.log(`  skip ${exit.name} (port ${exit.port} unreachable)`);
-    }
+  const checks = await Promise.all(exits.map(async (exit) => ({
+    exit,
+    alive: await checkPort(exit.port),
+  })));
+  const reachable = checks.filter(c => c.alive).map(c => c.exit);
+  for (const c of checks.filter(c => !c.alive)) {
+    console.log(`  skip ${c.exit.name} (port ${c.exit.port} unreachable)`);
   }
 
   if (reachable.length === 0) {
@@ -737,8 +770,12 @@ async function cmdProbe() {
   const { assignments, defaultExit } = optimise(probes);
 
   const yaml = settingsOptimal(secretKey, exits, assignments, defaultExit);
-  await applySettings(yaml);
-  await waitForReady();
+  try {
+    await applySettings(yaml);
+    await waitForReady();
+  } catch (e: any) {
+    console.log(`⚠ Could not push routes to container (${e.message})`);
+  }
 
   const matrix: HealthMatrix = {
     timestamp: new Date().toISOString(),
@@ -808,13 +845,11 @@ async function reprobeEngine(url: URL): Promise<Response> {
   }
 
   const exits = await discoverExits();
-  const reachable: Exit[] = [];
-  for (const exit of exits) {
-    try {
-      execSync(`nc -z -G 2 127.0.0.1 ${exit.port}`, { stdio: "ignore", timeout: 3000 });
-      reachable.push(exit);
-    } catch { /* unreachable */ }
-  }
+  const checks = await Promise.all(exits.map(async (exit) => ({
+    exit,
+    alive: await checkPort(exit.port),
+  })));
+  const reachable = checks.filter(c => c.alive).map(c => c.exit);
 
   if (reachable.length === 0) {
     return Response.json({ ok: false, error: "no reachable exits" });
@@ -862,8 +897,12 @@ async function reprobeEngine(url: URL): Promise<Response> {
     const secretKey = await getSecretKey();
     const { _default, ...engineAssignments } = matrix.assignments;
     const yaml = settingsOptimal(secretKey, exits, engineAssignments, defaultExit);
-    await applySettings(yaml);
-    await waitForReady();
+    try {
+      await applySettings(yaml);
+      await waitForReady();
+    } catch (e: any) {
+      console.log(`⚠ Could not push routes to container (${e.message})`);
+    }
   }
 
   matrix.timestamp = new Date().toISOString();
@@ -945,15 +984,11 @@ async function statusLog(url: URL): Promise<Response> {
 
 async function getTunnelStatus(): Promise<{ name: string; country: string; port: number; alive: boolean }[]> {
   const exits = await discoverExits();
-  return exits.map(exit => {
-    let alive = false;
-    try {
-      execSync(`nc -z -G 2 127.0.0.1 ${exit.port}`, { stdio: "ignore", timeout: 3000 });
-      alive = true;
-    } catch { /* dead */ }
+  return Promise.all(exits.map(async (exit) => {
+    const alive = await checkPort(exit.port);
     const country = exit.country ? (COUNTRY_NAMES[exit.country] ?? exit.country) : (exit.type === "tor" ? "Tor network" : "-");
     return { name: exit.name, country, port: exit.port, alive };
-  });
+  }));
 }
 
 async function loadHealthMatrix(): Promise<HealthMatrix | null> {

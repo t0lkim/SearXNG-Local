@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1] - 2026-09-11
+
+- **Fix:** Replace all blocking `execSync` calls with async `execAsync` and `checkPort` helpers so the HTTP server stays responsive during probe cycles
+- **Fix:** `applySettings` failures (e.g. `container copy` timeout) no longer crash the process - caught and logged, proxy routing continues
+- **Fix:** `getSecretKey` reads local `.runtime/settings-live.yml` first, falls back to `container exec` with 10s timeout
+- **Perf:** Tunnel and port checks now run in parallel via `Promise.all`
+
 ## [0.9.0] - 2026-09-11
 
 - **New:** macOS LaunchAgent support - `./setup.sh install-agent` generates and installs a LaunchAgent so SearXNG starts automatically on login; `./setup.sh uninstall-agent` to remove

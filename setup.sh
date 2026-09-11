@@ -439,6 +439,7 @@ has_vpn_configs() {
 PROXY_PID_FILE="${SCRIPT_DIR}/.runtime/proxy.pid"
 
 start_proxy_watch() {
+  if [[ "${SEARXNG_SKIP_PROXY_WATCH:-}" == "1" ]]; then return; fi
   if ! has_vpn_configs; then return; fi
   if ! command -v bun >/dev/null 2>&1; then
     warn "bun not found - skipping proxy routing. Install: brew install oven-sh/bun/bun"
