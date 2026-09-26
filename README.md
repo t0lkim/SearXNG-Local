@@ -71,15 +71,21 @@ For manual control:
 ### How it works
 
 1. Spawns a wireproxy SOCKS5 instance for each `.conf` file in `vpn-configs/`
-2. Probes every enabled engine through every exit concurrently (all exits in parallel, ~15 seconds total)
-3. Picks the exit that serves the most engines as the default
-4. Routes engines that are blocked on the default to an exit where they work
-5. Applies a verification search and re-routes any engine that still fails
-6. Monitors tunnel health and engine availability every 5 minutes, re-routing as needed
+2. Checks every tunnel on the path search uses: from inside the SearXNG container, with SearXNG's own HTTP client, through the same proxy URL written into `settings.yml`. A tunnel is **up** only if a request through it returns an exit IP that differs from your own
+3. Probes every engine through every up tunnel, the same way
+4. Picks the up tunnel that serves the most engines as the default, and routes engines blocked there to a tunnel where they work
+5. Writes the settings into the container, restarts SearXNG and reads the file back; only a byte-identical read-back counts as applied
+6. Every 5 minutes, re-checks every tunnel and restarts any that carry no data; re-probes engines and re-routes when routes go stale, configs change, or 30 minutes pass
 
-The reverse proxy starts immediately - search is available while the first probe cycle runs in the background. The health matrix is saved to `.runtime/health-matrix.json` and used as a historical fallback when a current probe shows no alternative for a blocked engine.
+It fails closed. Search through `:8080` returns 503 with the reason until routes are applied, and whenever no tunnel carries data SearXNG is pointed at a blackhole proxy. It never falls back to searching from your own IP. The gate covers `:8080`; SearXNG itself also answers on `127.0.0.1:8082` and on the container VM address, but its settings always route through a tunnel or the blackhole, so those paths cannot egress directly either. The default `radio browser` engine is removed because it resolves DNS outside the proxy at startup.
 
-**Note:** Bing serves Cloudflare Turnstile challenges to all known VPN and Tor IP ranges, so it will always show as blocked in the health matrix. This is a Bing-side restriction with no workaround through proxy routing.
+The dashboard, `/api/status` and `./setup.sh proxy status` read `.runtime/health-matrix.json`, which holds each tunnel's status, exit IP, country and check time, the engine matrix, the routes and the last apply result. Each tunnel logs to `.runtime/logs/wp-<name>.log`.
+
+**Apple container networking:** the SearXNG VM cannot reach the Mac's loopback, so tunnels listen on the vmnet gateway (the host-only bridge shown by `container network list`), which is not exposed to your LAN. Tor stays on loopback; the manager relays the gateway's port 9050 to it, so no `torrc` change is needed.
+
+**Connection limits:** each `.conf` in `vpn-configs/` holds one VPN connection open for as long as the manager runs, and counts against your provider's simultaneous-connection limit alongside your other devices. Configs beyond the limit can complete a handshake yet carry no data; keep the count within what your plan allows. Tunnels that carry no data are restarted with backoff (up to about once an hour) so they do not keep opening new sessions.
+
+**Note:** Bing serves Cloudflare Turnstile challenges to all known VPN and Tor IP ranges, so it will usually show as blocked in the health matrix. This is a Bing-side restriction with no workaround through proxy routing.
 
 ## Usage
 
@@ -98,7 +104,7 @@ The reverse proxy starts immediately - search is available while the first probe
 
 ### Status dashboard
 
-When proxy routing is active, visit [http://localhost:8080/stats](http://localhost:8080/stats) for a live dashboard showing engine routing, tunnel health (with country labels), and the full health matrix. JSON endpoints are available at `/api/status` and `/api/log`.
+When proxy routing is active, visit [http://localhost:8080/stats](http://localhost:8080/stats) for a live dashboard showing whether each tunnel carries data (with exit IP, country and check age), whether the settings applied, engine routing, and the full health matrix. JSON endpoints are available at `/api/status` and `/api/log`.
 
 ### Custom bind address
 
@@ -135,38 +141,14 @@ The bundled `settings.yml` uses SearXNG defaults with `image_proxy` enabled. See
 
 ### macOS (launchd)
 
-With Apple container, the system service runs via `brew services start container`. The SearXNG container itself can be managed by a launchd agent.
-
-Create `~/Library/LaunchAgents/local.searxng.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>local.searxng</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/bin/bash</string>
-    <string>/path/to/SearXNG-Local/setup.sh</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>/tmp/searxng.log</string>
-  <key>StandardErrorPath</key>
-  <string>/tmp/searxng.log</string>
-</dict>
-</plist>
-```
-
-Then load it:
+With Apple container, the system service runs via `brew services start container`. To start SearXNG and the proxy manager on login:
 
 ```bash
-launchctl load ~/Library/LaunchAgents/local.searxng.plist
+./setup.sh install-agent     # generate, install and load the LaunchAgent
+./setup.sh uninstall-agent   # remove it
 ```
+
+The agent runs `searxng-start.sh`, logs to `~/Library/Logs/searxng-local/searxng.log` (the dashboard's activity log shows this file), and relaunches the manager if it exits abnormally, including after its own watchdog trips.
 
 ### GNU/Linux (systemd user unit)
 

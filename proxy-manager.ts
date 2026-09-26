@@ -1,69 +1,111 @@
 #!/usr/bin/env bun
 
-import { readdir, readFile, writeFile, mkdir, unlink } from "node:fs/promises";
+import { readdir, readFile, writeFile, mkdir, unlink, stat, rename, chmod } from "node:fs/promises";
+import { openSync, closeSync } from "node:fs";
+import { createServer, connect } from "node:net";
 import { join } from "node:path";
-import { execSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 
-const VERSION = "0.9.1";
+const VERSION = "0.10.0";
 
-async function execAsync(cmd: string, timeout = 30_000): Promise<string> {
-  const proc = Bun.spawn(["sh", "-c", cmd], { stdout: "pipe", stderr: "pipe" });
-  const result = await Promise.race([
-    proc.exited,
-    Bun.sleep(timeout).then(() => "timeout" as const),
-  ]);
-  if (result === "timeout") {
-    proc.kill();
-    throw new Error(`Command timed out after ${timeout}ms: ${cmd}`);
-  }
-  const stdout = await new Response(proc.stdout).text();
-  if (result !== 0) throw new Error(`Command failed (exit ${result}): ${cmd}`);
-  return stdout.trim();
-}
-
-async function checkPort(port: number): Promise<boolean> {
-  try {
-    const proc = Bun.spawn(["nc", "-z", "-G", "2", "127.0.0.1", String(port)], {
-      stdout: "ignore", stderr: "ignore",
-    });
-    return (await proc.exited) === 0;
-  } catch { return false; }
-}
 const ROOT = import.meta.dir;
 const VPN_DIR = join(ROOT, "vpn-configs");
 const RUNTIME_DIR = join(ROOT, ".runtime");
+const TUNNEL_LOG_DIR = join(RUNTIME_DIR, "logs");
 const HEALTH_FILE = join(RUNTIME_DIR, "health-matrix.json");
+// The file this manager's own output goes to; launchers set it so the dashboard shows the live log
+const LOG_FILE = process.env.SEARXNG_PROXY_LOG || join(RUNTIME_DIR, "proxy-watch.log");
 const SEARXNG_INTERNAL_PORT = 8082;
 const SEARXNG_URL = `http://localhost:${SEARXNG_INTERNAL_PORT}`;
 const CONTAINER_NAME = "searxng";
+const CONTAINER_SETTINGS = "/etc/searxng/settings.yml";
+const SEARXNG_HOME = "/usr/local/searxng";
+const SEARXNG_PYTHON = `${SEARXNG_HOME}/.venv/bin/python3`;
 const TOR_PORT = 9050;
 const WP_BASE_PORT = 10801;
 const WP_BIN = join(process.env.HOME!, "go", "bin", "wireproxy");
-const PROBE_TIMEOUT = 15_000;
-const READY_TIMEOUT = 20_000;
+const TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace";
+// IPv4 literal: tunnels are IPv4-only, so the host IP they are compared with must be IPv4 too
+const HOST_TRACE_URL = "https://1.1.1.1/cdn-cgi/trace";
+// Matches SearXNG's own request_timeout: a tunnel slower than this would fail real searches too
+const TRACE_TIMEOUT = 10;
+const ENGINE_TIMEOUT = 15;
+const HANDSHAKE_TIMEOUT = 10_000;
+const READY_TIMEOUT = 30_000;
 const MONITOR_INTERVAL = 300_000;
 const FORCED_PROBE_INTERVAL = 1_800_000;
 const PROXY_PORT = 8080;
 const TOR_CONTROL_PORT = 9051;
 const TOR_CONTROL_PASS = "searxng-local";
 const TOR_RETRY_MAX = 5;
+// A tunnel that keeps carrying no data is restarted after 1, 2, 4, 8 then every 12 monitor cycles (5 min each):
+// every restart is a new session on the VPN account, so a dead tunnel must not reconnect every cycle
+const RESTART_BACKOFF_MAX_CYCLES = 12;
+const TUNNEL_LOG_MAX = 1_000_000;
+// Nothing listens here inside the container: used when no tunnel carries data, so search fails instead of going direct
+const BLACKHOLE_PROXY = "socks5h://127.0.0.1:9";
+// Monitor loop must tick at least this often (wall clock) or the process exits for launchd to restart it
+const WATCHDOG_STALL_LIMIT = 3_600_000;
+const SLEEP_SLICE = 10_000;
 
-function detectRuntime(): string {
-  if (process.platform === "darwin") {
-    try {
-      execSync("command -v container", { stdio: "ignore" });
-      return "container";
-    } catch { /* fall through */ }
+// ─── Process helpers (argv only, never a shell) ─────────────
+
+interface RunResult { code: number; stdout: string; stderr: string }
+
+async function run(argv: string[], opts: { stdin?: string; timeout?: number } = {}): Promise<RunResult> {
+  const proc = Bun.spawn(argv, {
+    stdin: opts.stdin !== undefined ? new Blob([opts.stdin]) : "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const out = new Response(proc.stdout).text();
+  const err = new Response(proc.stderr).text();
+  const result = await Promise.race([
+    proc.exited,
+    Bun.sleep(opts.timeout ?? 30_000).then(() => "timeout" as const),
+  ]);
+  if (result === "timeout") {
+    proc.kill(9);
+    throw new Error(`timed out after ${opts.timeout ?? 30_000}ms: ${argv.slice(0, 3).join(" ")}`);
   }
-  try {
-    execSync("command -v podman", { stdio: "ignore" });
-    return "podman";
-  } catch {
-    throw new Error("No container runtime found (container or podman)");
-  }
+  return { code: result, stdout: (await out).trim(), stderr: (await err).trim() };
+}
+
+async function runOk(argv: string[], opts: { stdin?: string; timeout?: number } = {}): Promise<string> {
+  const r = await run(argv, opts);
+  if (r.code !== 0) throw new Error(`${argv.slice(0, 3).join(" ")} exited ${r.code}: ${r.stderr.slice(0, 200)}`);
+  return r.stdout;
+}
+
+// ─── Runtime and addressing ─────────────────────────────────
+
+function detectRuntime(): "container" | "podman" {
+  const forced = process.env.SEARXNG_RUNTIME;
+  if (forced === "container" || forced === "podman") return forced;
+  if (process.platform === "darwin" && Bun.which("container")) return "container";
+  if (Bun.which("podman")) return "podman";
+  throw new Error("No container runtime found (container or podman)");
 }
 
 const CONTAINER_RUNTIME = detectRuntime();
+
+// Apple container reaches the host only via its vmnet gateway (host-only bridge, not the LAN);
+// Podman resolves host.containers.internal and forwards to host loopback
+function vmnetGateway(): string {
+  const r = Bun.spawnSync(["container", "network", "list", "--format", "json"]);
+  const nets = JSON.parse(r.stdout.toString() || "[]");
+  const gw = nets.find((n: { id: string }) => n.id === "default")?.status?.ipv4Gateway;
+  if (!gw) throw new Error("container network \"default\" has no ipv4Gateway - is the container service running?");
+  return gw;
+}
+const TUNNEL_HOST = process.env.SEARXNG_TUNNEL_HOST
+  || (CONTAINER_RUNTIME === "container" ? vmnetGateway() : "127.0.0.1");
+const CONTAINER_HOST = CONTAINER_RUNTIME === "container" ? TUNNEL_HOST : "host.containers.internal";
+
+// The one place a proxy URL is built: SearXNG's settings and the probe both use it, so what is measured is what search uses
+function proxyUrl(exit: Exit): string {
+  return `socks5h://${CONTAINER_HOST}:${exit.port}`;
+}
 
 const COUNTRY_NAMES: Record<string, string> = {
   AT: "Austria", AU: "Australia", BE: "Belgium", BG: "Bulgaria", BR: "Brazil",
@@ -85,6 +127,24 @@ const ENABLE_ENGINES = [
   "privacywall", "qwant", "vuhuv", "wiby", "yahoo", "yep",
 ];
 
+const ENGINE_URLS: [string, string][] = [
+  ["bing", "https://www.bing.com/search?q=test"],
+  ["brave", "https://search.brave.com/search?q=test"],
+  ["crowdview", "https://crowdview.ai/?q=test"],
+  ["duckduckgo", "https://html.duckduckgo.com/html/?q=test"],
+  ["gmx", "https://search.gmx.net/web?q=test"],
+  ["google", "https://www.google.com/search?q=test"],
+  ["mojeek", "https://www.mojeek.com/search?q=test"],
+  ["mwmbl", "https://mwmbl.org/?q=test"],
+  ["qwant", "https://www.qwant.com/?q=test"],
+  ["startpage", "https://www.startpage.com/sp/search?query=test"],
+  ["wiby", "https://wiby.me/?q=test"],
+  ["yahoo", "https://search.yahoo.com/search?p=test"],
+  ["yep", "https://yep.com/web?q=test"],
+];
+
+// ─── Types and state ────────────────────────────────────────
+
 interface Exit {
   name: string;
   type: "tor" | "vpn";
@@ -104,14 +164,204 @@ interface ExitProbe {
   engines: EngineResult[];
 }
 
+// up: carried data on SearXNG's path with an exit IP that is not the host's
+// down: no data; bypass: exit IP equals the host's own IP; unverified: host IP unknown, so bypass cannot be ruled out
+type TunnelStatus = "up" | "down" | "bypass" | "unverified";
+
+interface TunnelState {
+  status: TunnelStatus;
+  checkedAt: string;
+  exitIp?: string;
+  loc?: string;
+  detail?: string;
+}
+
+interface ApplyResult {
+  at: string;
+  ok: boolean;
+  detail: string;
+}
+
 interface HealthMatrix {
   timestamp: string;
   probes: ExitProbe[];
   assignments: Record<string, string>;
+  tunnels: Record<string, TunnelState>;
+  apply: ApplyResult | null;
 }
 
-const processes = new Map<string, Subprocess>();
 type Subprocess = ReturnType<typeof Bun.spawn>;
+const processes = new Map<string, Subprocess>();
+
+function emptyMatrix(): HealthMatrix {
+  return { timestamp: "", probes: [], assignments: {}, tunnels: {}, apply: null };
+}
+
+async function loadHealthMatrix(): Promise<HealthMatrix | null> {
+  try {
+    const m = JSON.parse(await readFile(HEALTH_FILE, "utf-8"));
+    return { ...emptyMatrix(), ...m, tunnels: m.tunnels ?? {}, apply: m.apply ?? null };
+  } catch { return null; }
+}
+
+let state: HealthMatrix = emptyMatrix();
+// Search through :8080 is served only once routes are applied, read back and backed by at least one up tunnel
+let routingReady = false;
+// True once this process has completed its first routing cycle; reprobe is refused before that
+let firstRouteDone = false;
+
+// Serialises tunnel checks, routing cycles and reprobes: each can restart the container under the others
+let lockTail: Promise<void> = Promise.resolve();
+let lockHeld = false;
+async function exclusive<T>(fn: () => Promise<T>): Promise<T> {
+  const prev = lockTail;
+  let release!: () => void;
+  lockTail = new Promise<void>(r => { release = r; });
+  await prev;
+  lockHeld = true;
+  try { return await fn(); } finally { lockHeld = false; release(); }
+}
+
+async function saveState(): Promise<void> {
+  await writeFile(HEALTH_FILE, JSON.stringify(state, null, 2));
+}
+
+function isUp(name: string): boolean {
+  return state.tunnels[name]?.status === "up";
+}
+
+function log(msg: string): void {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
+// ─── In-container probe ─────────────────────────────────────
+// Runs inside the SearXNG container with SearXNG's own HTTP client (searx.network.client, curl_cffi
+// with browser impersonation), through the same proxy URL written into settings.yml.
+
+const PROBE_PY = String.raw`
+import asyncio, json, sys
+from searx.network.client import new_client
+
+CAPTCHA = ("g-recaptcha", "recaptcha/api", "hcaptcha.com", "cf-turnstile",
+           "please verify you are a human", "unusual traffic")
+
+def client(proxy):
+    return new_client(enable_http=False, verify=True, enable_http2=True, enable_http3=False,
+                      max_connections=10, proxies={"all://": proxy}, local_address=None, max_redirects=5)
+
+async def trace(c, url, timeout):
+    try:
+        r = await c.request("GET", url, timeout=timeout)
+    except Exception as e:
+        return {"ok": False, "detail": (type(e).__name__ + ": " + str(e))[:200]}
+    kv = dict(l.split("=", 1) for l in r.text.splitlines() if "=" in l)
+    if r.status_code == 200 and kv.get("ip"):
+        return {"ok": True, "ip": kv["ip"], "loc": kv.get("loc")}
+    return {"ok": False, "detail": "HTTP %d" % r.status_code}
+
+async def engine(c, name, url, timeout):
+    try:
+        r = await c.request("GET", url, timeout=timeout)
+    except Exception as e:
+        return {"engine": name, "status": "timeout", "detail": type(e).__name__}
+    code = r.status_code
+    if code in (403, 429, 503):
+        return {"engine": name, "status": "blocked", "detail": "HTTP %d" % code}
+    if 200 <= code < 400:
+        body = r.text.lower()
+        if any(m in body for m in CAPTCHA):
+            return {"engine": name, "status": "captcha", "detail": "CAPTCHA detected"}
+        return {"engine": name, "status": "ok"}
+    return {"engine": name, "status": "error", "detail": "HTTP %d" % code}
+
+async def one(t, job):
+    c = client(t["proxy"])
+    try:
+        res = {"name": t["name"], "trace": await trace(c, job["trace_url"], job["trace_timeout"])}
+        if job["engines"] and res["trace"]["ok"]:
+            out = []
+            for i, (name, url) in enumerate(job["engines"]):
+                if i:
+                    await asyncio.sleep(0.5)
+                out.append(await engine(c, name, url, job["engine_timeout"]))
+            res["engines"] = out
+        return res
+    finally:
+        await c.aclose()
+
+async def main():
+    job = json.load(sys.stdin)
+    work = asyncio.gather(*(one(t, job) for t in job["tunnels"]))
+    print(json.dumps(await asyncio.wait_for(work, job["deadline"])))
+
+asyncio.run(main())
+`;
+
+interface ProbeOutput {
+  name: string;
+  trace: { ok: boolean; ip?: string; loc?: string; detail?: string };
+  engines?: EngineResult[];
+}
+
+async function containerProbe(exits: Exit[], engines: [string, string][]): Promise<ProbeOutput[]> {
+  if (exits.length === 0) return [];
+  const job = {
+    tunnels: exits.map(e => ({ name: e.name, proxy: proxyUrl(e) })),
+    engines,
+    trace_url: TRACE_URL,
+    trace_timeout: TRACE_TIMEOUT,
+    engine_timeout: ENGINE_TIMEOUT,
+  };
+  const budget = 60_000 + engines.length * (ENGINE_TIMEOUT + 1) * 1000;
+  // Python gives up 15s before the host does, so it never outlives the exec client
+  Object.assign(job, { deadline: (budget - 15_000) / 1000 });
+  const out = await runOk(
+    [CONTAINER_RUNTIME, "exec", "-i", "-w", SEARXNG_HOME, CONTAINER_NAME, SEARXNG_PYTHON, "-c", PROBE_PY],
+    { stdin: JSON.stringify(job), timeout: budget },
+  );
+  return JSON.parse(out.split("\n").pop()!);
+}
+
+// The host's own public IP, fetched directly: a tunnel exiting with this address is not a tunnel.
+// A failed lookup falls back to the last known value (up to 24h old) rather than blackholing search.
+let lastHostIp: { ip: string; at: number } | null = null;
+async function hostPublicIp(): Promise<string | null> {
+  try {
+    const res = await fetch(HOST_TRACE_URL, { signal: AbortSignal.timeout(8000) });
+    const ip = (await res.text()).match(/^ip=(.+)$/m)?.[1];
+    if (ip) lastHostIp = { ip, at: Date.now() };
+  } catch { /* fall back below */ }
+  if (lastHostIp && Date.now() - lastHostIp.at < 86_400_000) return lastHostIp.ip;
+  return null;
+}
+
+function classifyTunnel(trace: ProbeOutput["trace"], hostIp: string | null): TunnelState {
+  const checkedAt = new Date().toISOString();
+  if (!trace.ok || !trace.ip) return { status: "down", checkedAt, detail: trace.detail ?? "no data" };
+  const base = { checkedAt, exitIp: trace.ip, loc: trace.loc };
+  if (!hostIp) return { ...base, status: "unverified", detail: "host IP unknown - cannot rule out bypass" };
+  if (trace.ip === hostIp) return { ...base, status: "bypass", detail: "exit IP is this machine's own IP" };
+  return { ...base, status: "up" };
+}
+
+// ─── Tor relay ──────────────────────────────────────────────
+// Under Apple container the SearXNG VM cannot reach the Mac's loopback, where Tor listens. Relay the
+// vmnet gateway's port 9050 (host-only, not the LAN) to Tor, so torrc stays untouched. pipe() carries backpressure.
+
+function startTorRelay(): void {
+  if (TUNNEL_HOST === "127.0.0.1") return;
+  const server = createServer(client => {
+    const upstream = connect(TOR_PORT, "127.0.0.1");
+    client.pipe(upstream);
+    upstream.pipe(client);
+    client.on("error", () => upstream.destroy());
+    upstream.on("error", () => client.destroy());
+    client.on("close", () => upstream.destroy());
+    upstream.on("close", () => client.destroy());
+  });
+  server.on("error", (e: Error) => log(`✗ Tor relay on ${TUNNEL_HOST}:${TOR_PORT} failed: ${e.message}`));
+  server.listen(TOR_PORT, TUNNEL_HOST, () => console.log(`Tor relay: ${TUNNEL_HOST}:${TOR_PORT} → 127.0.0.1:${TOR_PORT}`));
+}
 
 // ─── Tor circuit rotation ──────────────────────────────────
 
@@ -145,24 +395,24 @@ async function rotateTorCircuit(): Promise<boolean> {
   }
 }
 
-async function rotateTorUntilQwantWorks(): Promise<string | null> {
-  const qwantUrl = ENGINE_URLS.find(([e]) => e === "qwant")?.[1];
-  if (!qwantUrl) return null;
-
+// For an engine that works on no exit and hits a CAPTCHA on Tor, try fresh Tor circuits
+async function rotateTorForEngine(tor: Exit, engine: string): Promise<EngineResult | null> {
+  const url = ENGINE_URLS.find(([e]) => e === engine)?.[1];
+  if (!url) return null;
   for (let attempt = 1; attempt <= TOR_RETRY_MAX; attempt++) {
-    console.log(`  Tor circuit rotation attempt ${attempt}/${TOR_RETRY_MAX}...`);
+    console.log(`  Tor circuit rotation for ${engine}, attempt ${attempt}/${TOR_RETRY_MAX}...`);
     if (!await rotateTorCircuit()) {
       console.log("    ✗ circuit rotation failed (control port)");
-      continue;
+      return null;
     }
     await Bun.sleep(3000);
-
-    const result = await directProbeEngine("qwant", qwantUrl, TOR_PORT);
-    if (result.status === "ok") {
-      console.log(`    ✓ qwant works on new Tor circuit`);
-      return "tor";
+    const [res] = await containerProbe([tor], [[engine, url]]);
+    const result = res?.engines?.[0];
+    if (result?.status === "ok") {
+      console.log(`    ✓ ${engine} works on new Tor circuit`);
+      return result;
     }
-    console.log(`    ✗ qwant still ${result.status}`);
+    console.log(`    ✗ ${engine} still ${result?.status ?? "unreachable"}`);
   }
   return null;
 }
@@ -183,7 +433,7 @@ function wgToWireproxyConfig(wgContent: string, socksPort: number): string {
       lines.push(line);
     }
   }
-  lines.push("", "[Socks5]", `BindAddress = 127.0.0.1:${socksPort}`, "");
+  lines.push("", "[Socks5]", `BindAddress = ${TUNNEL_HOST}:${socksPort}`, "");
   return lines.join("\n");
 }
 
@@ -212,7 +462,7 @@ async function discoverExits(): Promise<Exit[]> {
   for (const file of configs) {
     const base = file.replace(/\.conf$/, "");
     const name = base.replace(/^wg-/, "").toLowerCase();
-    const country = base.match(/^wg-([A-Z]{2})-/)?.[1];
+    const country = base.match(/^wg-([A-Z]{2})-/i)?.[1]?.toUpperCase();
     let port = stablePort(name);
     while (usedPorts.has(port)) port++;
     usedPorts.add(port);
@@ -227,161 +477,198 @@ async function discoverExits(): Promise<Exit[]> {
   return exits;
 }
 
-// ─── Process management ─────────────────────────────────────
+// ─── Tunnel processes ───────────────────────────────────────
 
-async function startProxies(exits: Exit[]): Promise<Exit[]> {
-  await mkdir(RUNTIME_DIR, { recursive: true });
-
-  // Kill any leftovers from previous runs
-  try { execSync("pkill -f wireproxy 2>/dev/null", { stdio: "ignore" }); } catch { /* fine */ }
-  await Bun.sleep(500);
-
-  return syncProxies(exits);
+function killOrphanTunnels(): void {
+  // Only wireproxy instances running our own runtime configs
+  Bun.spawnSync(["pkill", "-9", "-f", join(RUNTIME_DIR, "wp-")]);
 }
 
-async function syncProxies(exits: Exit[]): Promise<Exit[]> {
-  const vpnExits = exits.filter(e => e.type === "vpn" && e.configFile);
-  if (vpnExits.length === 0) return exits.filter(e => e.type === "tor");
-
-  const wanted = new Set(vpnExits.map(e => e.name));
-
-  // Remove proxies for configs that were deleted
-  for (const [name, proc] of processes) {
-    if (!wanted.has(name)) {
-      console.log(`  removing ${name} (config deleted)`);
-      try { proc.kill(); } catch { /* already dead */ }
-      processes.delete(name);
-      try { await unlink(join(RUNTIME_DIR, `wp-${name}.conf`)); } catch { /* fine */ }
-    }
-  }
-
-  // Start proxies for new or missing configs
-  const toStart = vpnExits.filter(e => !processes.has(e.name));
-  if (toStart.length > 0) {
-    for (const exit of toStart) {
-      const wg = await readFile(exit.configFile!, "utf-8");
-      const wp = wgToWireproxyConfig(wg, exit.port);
-      await writeFile(join(RUNTIME_DIR, `wp-${exit.name}.conf`), wp);
-    }
-
-    const spawned = toStart.map(exit => ({
-      exit,
-      proc: Bun.spawn([WP_BIN, "-c", join(RUNTIME_DIR, `wp-${exit.name}.conf`)], {
-        stdout: "ignore",
-        stderr: "pipe",
-      }),
-    }));
-
-    await Promise.all(
-      spawned.map(async ({ exit, proc }) => {
-        const ok = await waitForHandshake(proc, 10_000);
-        if (ok) {
-          processes.set(exit.name, proc);
-          console.log(`  ✓ ${exit.name} (port ${exit.port})`);
-        } else {
-          proc.kill();
-          console.log(`  ✗ ${exit.name}: failed to connect`);
-        }
-      })
-    );
-  }
-
-  const active = vpnExits.filter(e => processes.has(e.name));
-  return [exits.find(e => e.type === "tor")!, ...active];
+async function stopTunnel(name: string): Promise<void> {
+  const proc = processes.get(name);
+  processes.delete(name);
+  if (!proc) return;
+  // SIGKILL, because a frozen (stopped) process never acts on SIGTERM
+  proc.kill(9);
+  await Promise.race([proc.exited, Bun.sleep(3000)]);
 }
 
-async function waitForHandshake(proc: Subprocess, timeout: number): Promise<boolean> {
-  if (!proc.stderr) return false;
-  const reader = (proc.stderr as ReadableStream<Uint8Array>).getReader();
-  const decoder = new TextDecoder();
-  const deadline = Date.now() + timeout;
+// Log text written after a byte offset. The offset comes from stat().size (bytes), and wireproxy writes
+// multi-byte "…" in peer lines, so slicing the decoded string would skip past new lines on every restart.
+function textSince(buf: Buffer, byteOffset: number): string {
+  return buf.subarray(byteOffset).toString("utf-8");
+}
 
+// Tunnel stderr goes to .runtime/logs/wp-<name>.log (append, rotated at 1 MB) - never an unread pipe
+async function startTunnel(exit: Exit): Promise<boolean> {
+  await stopTunnel(exit.name);
+  const conf = join(RUNTIME_DIR, `wp-${exit.name}.conf`);
+  const wg = await readFile(exit.configFile!, "utf-8");
+  await writeFile(conf, wgToWireproxyConfig(wg, exit.port), { mode: 0o600 });
+  await chmod(conf, 0o600); // holds the private key; mode above only applies to new files
+
+  const logPath = join(TUNNEL_LOG_DIR, `wp-${exit.name}.log`);
+  let offset = 0;
   try {
-    while (Date.now() < deadline) {
-      const remaining = deadline - Date.now();
-      const result = await Promise.race([
-        reader.read(),
-        Bun.sleep(remaining).then(() => ({ done: true as const, value: undefined })),
-      ]);
-      if (result.done || !result.value) return false;
-      if (decoder.decode(result.value).includes("Received handshake response")) return true;
+    const size = (await stat(logPath)).size;
+    if (size > TUNNEL_LOG_MAX) await rename(logPath, `${logPath}.1`);
+    else offset = size;
+  } catch { /* no log yet */ }
+
+  const fd = openSync(logPath, "a", 0o600);
+  await chmod(logPath, 0o600);
+  const proc = Bun.spawn([WP_BIN, "-c", conf], { stdout: "ignore", stderr: fd });
+  closeSync(fd);
+
+  const deadline = Date.now() + HANDSHAKE_TIMEOUT;
+  while (Date.now() < deadline) {
+    await Bun.sleep(250);
+    if (proc.exitCode !== null) break;
+    const text = textSince(await readFile(logPath), offset);
+    if (text.includes("Received handshake response")) {
+      processes.set(exit.name, proc);
+      return true;
     }
-  } catch { /* stream error */ }
+  }
+  proc.kill(9);
   return false;
 }
 
-async function restartDeadTunnels(exits: Exit[]): Promise<number> {
-  const vpnExits = exits.filter(e => e.type === "vpn" && e.configFile);
-  const checks = await Promise.all(vpnExits.map(async (exit) => ({
-    exit,
-    alive: await checkPort(exit.port),
-  })));
-
-  let restarted = 0;
-  for (const { exit, alive } of checks) {
-    if (alive) continue;
-    console.log(`  ⚠ ${exit.name} dead - restarting...`);
-    const old = processes.get(exit.name);
-    if (old) { try { old.kill(); } catch { /* already dead */ } }
-    processes.delete(exit.name);
-
-    const wpConf = join(RUNTIME_DIR, `wp-${exit.name}.conf`);
-    try { await readFile(wpConf); } catch {
-      const wg = await readFile(exit.configFile!, "utf-8");
-      await writeFile(wpConf, wgToWireproxyConfig(wg, exit.port));
-    }
-    const proc = Bun.spawn([WP_BIN, "-c", wpConf], { stdout: "ignore", stderr: "pipe" });
-    if (await waitForHandshake(proc, 10_000)) {
-      processes.set(exit.name, proc);
-      console.log(`  ✓ ${exit.name} back up`);
-      restarted++;
-    } else {
-      proc.kill();
-      console.log(`  ✗ ${exit.name} failed to reconnect`);
-    }
+async function startTunnels(exits: Exit[]): Promise<void> {
+  const vpn = exits.filter(e => e.type === "vpn" && e.configFile);
+  const results = await Promise.all(vpn.map(async exit => ({ exit, ok: await startTunnel(exit) })));
+  for (const { exit, ok } of results) {
+    console.log(ok ? `  ✓ ${exit.name} handshake (port ${exit.port})` : `  ✗ ${exit.name}: no handshake`);
   }
-  return restarted;
 }
 
-async function stopProxies(): Promise<void> {
-  for (const [name, proc] of processes) {
-    proc.kill();
-    console.log(`  stopped ${name}`);
+// Remove tunnels whose config was deleted; start tunnels for new configs
+async function syncTunnels(exits: Exit[]): Promise<void> {
+  const wanted = new Set(exits.filter(e => e.type === "vpn").map(e => e.name));
+  for (const name of [...processes.keys()]) {
+    if (wanted.has(name)) continue;
+    console.log(`  removing ${name} (config deleted)`);
+    await stopTunnel(name);
+    delete state.tunnels[name];
+    try { await unlink(join(RUNTIME_DIR, `wp-${name}.conf`)); } catch { /* fine */ }
   }
-  processes.clear();
-  try { execSync("pkill -f wireproxy 2>/dev/null", { stdio: "ignore" }); } catch { /* fine */ }
+  await startTunnels(exits.filter(e => e.type === "vpn" && !processes.has(e.name)));
 }
 
-// ─── Container management ───────────────────────────────────
+// .runtime/wp-*.conf are derived copies holding private keys: drop ones whose vpn-configs source is gone
+async function sweepRuntimeConfigs(exits: Exit[]): Promise<void> {
+  const wanted = new Set(exits.filter(e => e.type === "vpn").map(e => `wp-${e.name}.conf`));
+  for (const file of await readdir(RUNTIME_DIR)) {
+    if (!/^wp-.+\.conf$/.test(file)) continue;
+    const path = join(RUNTIME_DIR, file);
+    if (wanted.has(file)) await chmod(path, 0o600);
+    else { await unlink(path); console.log(`  removed stale ${file} (no matching vpn-configs entry)`); }
+  }
+}
+
+async function stopAllTunnels(): Promise<void> {
+  for (const name of [...processes.keys()]) await stopTunnel(name);
+  killOrphanTunnels();
+}
+
+// ─── Tunnel health (data path) ──────────────────────────────
+
+// Measures every exit through SearXNG's own client; with restart, VPN tunnels that carry no data are
+// restarted once and measured again. Tor is a system service and is only measured.
+// Consecutive failed restarts per tunnel and how many cycles remain until the next one
+const restartBackoff = new Map<string, { failures: number; wait: number }>();
+
+function restartDue(name: string): boolean {
+  const b = restartBackoff.get(name);
+  if (!b) {
+    restartBackoff.set(name, { failures: 1, wait: 1 });
+    return true;
+  }
+  if (--b.wait > 0) return false;
+  b.failures++;
+  b.wait = Math.min(2 ** (b.failures - 1), RESTART_BACKOFF_MAX_CYCLES);
+  return true;
+}
+
+async function checkTunnels(exits: Exit[], opts: { restart: boolean }): Promise<void> {
+  const hostIp = await hostPublicIp();
+  let results: ProbeOutput[];
+  try {
+    results = await containerProbe(exits, []);
+  } catch (e: unknown) {
+    const detail = `probe failed: ${e instanceof Error ? e.message : e}`;
+    log(`✗ tunnel check ${detail}`);
+    for (const exit of exits) {
+      state.tunnels[exit.name] = { status: "down", checkedAt: new Date().toISOString(), detail };
+    }
+    await saveState();
+    return;
+  }
+  for (const r of results) state.tunnels[r.name] = classifyTunnel(r.trace, hostIp);
+
+  for (const exit of exits) {
+    if (state.tunnels[exit.name]?.status !== "down") restartBackoff.delete(exit.name);
+  }
+  // Drop state for exits whose config was removed, so no reader shows a tunnel that no longer exists
+  const names = new Set(exits.map(e => e.name));
+  for (const name of Object.keys(state.tunnels)) if (!names.has(name)) delete state.tunnels[name];
+
+  if (opts.restart) {
+    const dead = exits.filter(e => e.type === "vpn" && e.configFile && state.tunnels[e.name]?.status === "down"
+      && restartDue(e.name));
+    const waiting = exits.filter(e => e.type === "vpn" && state.tunnels[e.name]?.status === "down" && !dead.includes(e));
+    for (const e of waiting) {
+      const b = restartBackoff.get(e.name)!;
+      console.log(`    ${e.name}: no data, next restart in ${b.wait} cycle(s)`);
+    }
+    if (dead.length > 0) {
+      log(`restarting ${dead.length} tunnel(s) with no data: ${dead.map(e => e.name).join(", ")}`);
+      await Promise.all(dead.map(startTunnel));
+      const again = await containerProbe(dead, []).catch(() => [] as ProbeOutput[]);
+      for (const r of again) state.tunnels[r.name] = classifyTunnel(r.trace, hostIp);
+    }
+  }
+  await saveState();
+
+  const counts: Record<string, number> = {};
+  for (const exit of exits) {
+    const s = state.tunnels[exit.name]?.status ?? "down";
+    counts[s] = (counts[s] ?? 0) + 1;
+  }
+  log(`tunnels: ${Object.entries(counts).map(([s, n]) => `${n} ${s}`).join(", ")}`);
+  for (const exit of exits) {
+    const t = state.tunnels[exit.name];
+    if (t && t.status !== "up") console.log(`    ${exit.name}: ${t.status}${t.detail ? ` (${t.detail})` : ""}`);
+  }
+}
+
+// ─── Container settings ─────────────────────────────────────
+
+async function readContainerSettings(): Promise<string | null> {
+  try {
+    return await runOk([CONTAINER_RUNTIME, "exec", CONTAINER_NAME, "cat", CONTAINER_SETTINGS], { timeout: 15_000 });
+  } catch { return null; }
+}
 
 async function getSecretKey(): Promise<string> {
-  // Try local runtime copy first (avoids container exec which can hang)
-  try {
-    const local = await readFile(join(RUNTIME_DIR, "settings-live.yml"), "utf-8");
-    const match = local.match(/secret_key:\s*"([^"]+)"/);
+  for (const source of [readContainerSettings(), readFile(join(RUNTIME_DIR, "settings-live.yml"), "utf-8").catch(() => null)]) {
+    const match = (await source)?.match(/secret_key:\s*"([^"]+)"/);
     if (match) return match[1];
-  } catch { /* no local copy yet */ }
-  try {
-    const execCmd = CONTAINER_RUNTIME === "container" ? "container exec" : "podman exec";
-    const out = await execAsync(
-      `${execCmd} ${CONTAINER_NAME} grep secret_key /etc/searxng/settings.yml 2>/dev/null`,
-      10_000,
-    );
-    const match = out.match(/secret_key:\s*"([^"]+)"/);
-    if (match) return match[1];
-  } catch { /* container exec failed or timed out */ }
-  return await execAsync("openssl rand -hex 16");
+  }
+  return randomBytes(16).toString("hex");
 }
 
-async function applySettings(yaml: string): Promise<void> {
-  const tmp = join(RUNTIME_DIR, "settings-live.yml");
-  await writeFile(tmp, yaml);
-  const cpCmd = CONTAINER_RUNTIME === "container" ? "container copy" : "podman cp";
-  await execAsync(`${cpCmd} "${tmp}" ${CONTAINER_NAME}:/etc/searxng/settings.yml`);
-  const restartCmd = CONTAINER_RUNTIME === "container"
-    ? `container stop ${CONTAINER_NAME} && container start ${CONTAINER_NAME}`
-    : `podman restart ${CONTAINER_NAME}`;
-  await execAsync(restartCmd);
+async function startContainer(): Promise<void> {
+  await run([CONTAINER_RUNTIME, "start", CONTAINER_NAME], { timeout: 60_000 });
+}
+
+async function restartContainer(): Promise<void> {
+  if (CONTAINER_RUNTIME === "container") {
+    await runOk(["container", "stop", CONTAINER_NAME], { timeout: 60_000 });
+    await runOk(["container", "start", CONTAINER_NAME], { timeout: 60_000 });
+  } else {
+    await runOk(["podman", "restart", CONTAINER_NAME], { timeout: 60_000 });
+  }
 }
 
 async function waitForReady(timeout = READY_TIMEOUT): Promise<boolean> {
@@ -396,32 +683,64 @@ async function waitForReady(timeout = READY_TIMEOUT): Promise<boolean> {
   return false;
 }
 
-// ─── Settings generation ────────────────────────────────────
+// Writes settings through exec stdin (Apple `container copy` exits 0 but writes beneath the volume mount),
+// restarts SearXNG, then reads the file back: only a byte-identical read-back counts as applied.
+// The last settings this process saw SearXNG restart on and read back
+let confirmedYaml: string | null = null;
 
-function engineEnablements(): string {
-  return ENABLE_ENGINES.map(e => `  - name: ${e}\n    disabled: false`).join("\n");
+async function applySettings(yaml: string): Promise<ApplyResult> {
+  const at = new Date().toISOString();
+  await writeFile(join(RUNTIME_DIR, "settings-live.yml"), yaml, { mode: 0o600 });
+  try {
+    let current = await readContainerSettings();
+    if (current === null) {
+      // exec fails when the container is stopped (e.g. a failed restart): start it rather than wait for a human
+      await startContainer();
+      await waitForReady();
+      current = await readContainerSettings();
+    }
+    if (current === yaml.trim() && confirmedYaml === yaml) {
+      return { at, ok: true, detail: "unchanged" };
+    }
+    await runOk(
+      [CONTAINER_RUNTIME, "exec", "-i", CONTAINER_NAME, "sh", "-c", `cat > ${CONTAINER_SETTINGS}`],
+      { stdin: yaml, timeout: 30_000 },
+    );
+    await restartContainer();
+    if (!await waitForReady()) return { at, ok: false, detail: "SearXNG did not come back after restart" };
+    const back = await readContainerSettings();
+    if (back !== yaml.trim()) return { at, ok: false, detail: "read-back mismatch: container is not running the generated settings" };
+    confirmedYaml = yaml;
+    return { at, ok: true, detail: "applied and read back" };
+  } catch (e: unknown) {
+    return { at, ok: false, detail: e instanceof Error ? e.message : String(e) };
+  }
 }
+
+// ─── Settings generation ────────────────────────────────────
 
 function settingsOptimal(
   secretKey: string,
   exits: Exit[],
   assignments: Record<string, string>,
-  defaultExit: string,
+  defaultExit: string | null,
 ): string {
-  const usedExits = new Set([defaultExit, ...Object.values(assignments)]);
+  const byName = new Map(exits.map(e => [e.name, e]));
+  const usedExits = new Set([...(defaultExit ? [defaultExit] : []), ...Object.values(assignments)]);
 
   let networks = "";
-  for (const exit of exits) {
-    if (!usedExits.has(exit.name)) continue;
+  for (const name of [...usedExits].sort()) {
+    const exit = byName.get(name);
+    if (!exit) continue;
     networks += `    ${exit.name}:\n`;
     networks += `      proxies:\n`;
     networks += `        "all://":\n`;
-    networks += `          - "socks5h://host.containers.internal:${exit.port}"\n`;
+    networks += `          - "${proxyUrl(exit)}"\n`;
   }
 
   // Merge engine enablements with network assignments
   const routedMap = new Map(
-    Object.entries(assignments).filter(([, e]) => e !== defaultExit),
+    Object.entries(assignments).filter(([, e]) => e !== defaultExit && byName.has(e)),
   );
   const allEngineNames = new Set([...ENABLE_ENGINES, ...routedMap.keys()]);
 
@@ -432,9 +751,13 @@ function settingsOptimal(
     if (routedMap.has(name)) engineSection += `    network: ${routedMap.get(name)}\n`;
   }
 
-  const defaultPort = exits.find(e => e.name === defaultExit)?.port ?? TOR_PORT;
+  const defaultExitObj = defaultExit ? byName.get(defaultExit) : undefined;
+  const defaultProxy = defaultExitObj ? proxyUrl(defaultExitObj) : BLACKHOLE_PROXY;
 
-  return `use_default_settings: true
+  return `use_default_settings:
+  engines:
+    remove:
+      - radio browser   # its init() does direct DNS lookups outside outgoing.proxies
 
 server:
   secret_key: "${secretKey}"
@@ -446,88 +769,21 @@ search:
     - json
 
 outgoing:
-  networks:
-${networks}  proxies:
+${networks ? `  networks:\n${networks}` : ""}  proxies:
     "all://":
-      - "socks5h://host.containers.internal:${defaultPort}"
+      - "${defaultProxy}"
   request_timeout: 10.0
   max_request_timeout: 15.0
   useragent_suffix: ""
 ${engineSection}`;
 }
 
-// ─── Health probing ─────────────────────────────────────────
-
-const ENGINE_URLS: [string, string][] = [
-  ["bing", "https://www.bing.com/search?q=test"],
-  ["brave", "https://search.brave.com/search?q=test"],
-  ["crowdview", "https://crowdview.ai/?q=test"],
-  ["duckduckgo", "https://html.duckduckgo.com/html/?q=test"],
-  ["gmx", "https://search.gmx.net/web?q=test"],
-  ["google", "https://www.google.com/search?q=test"],
-  ["mojeek", "https://www.mojeek.com/search?q=test"],
-  ["mwmbl", "https://mwmbl.org/?q=test"],
-  ["qwant", "https://www.qwant.com/?q=test"],
-  ["startpage", "https://www.startpage.com/sp/search?query=test"],
-  ["wiby", "https://wiby.me/?q=test"],
-  ["yahoo", "https://search.yahoo.com/search?p=test"],
-  ["yep", "https://yep.com/web?q=test"],
-];
-
-async function directProbeEngine(
-  engine: string, url: string, socksPort: number,
-): Promise<EngineResult> {
-  try {
-    const proc = Bun.spawn(
-      ["curl", "-s", "-o", "-", "-w", "\n%{http_code}",
-       "--proxy", `socks5h://127.0.0.1:${socksPort}`,
-       "-L", "--max-time", "15", "-A", "Mozilla/5.0", url],
-      { stdout: "pipe", stderr: "ignore" },
-    );
-    const out = await new Response(proc.stdout).text();
-    const lines = out.trimEnd().split("\n");
-    const code = parseInt(lines[lines.length - 1], 10);
-    const body = lines.slice(0, -1).join("\n").toLowerCase();
-
-    if (code === 0 || isNaN(code)) return { engine, status: "timeout" };
-    if (code === 403 || code === 429 || code === 503)
-      return { engine, status: "blocked", detail: `HTTP ${code}` };
-    if (code >= 200 && code < 400) {
-      const isCaptcha =
-        body.includes("g-recaptcha") ||
-        body.includes("recaptcha/api") ||
-        body.includes("hcaptcha.com") ||
-        body.includes("cf-turnstile") ||
-        body.includes("please verify you are a human") ||
-        body.includes("unusual traffic");
-      if (isCaptcha) return { engine, status: "captcha", detail: "CAPTCHA detected" };
-      return { engine, status: "ok" };
-    }
-    return { engine, status: "error", detail: `HTTP ${code}` };
-  } catch {
-    return { engine, status: "timeout" };
-  }
-}
-
-async function directProbeExit(exit: Exit): Promise<ExitProbe> {
-  const results: EngineResult[] = [];
-  for (const [eng, url] of ENGINE_URLS) {
-    results.push(await directProbeEngine(eng, url, exit.port));
-    if (results.length < ENGINE_URLS.length) await Bun.sleep(500);
-  }
-  const ok = results.filter(r => r.status === "ok").length;
-  const bad = results.length - ok;
-  console.log(`  probed ${exit.name}: ${ok} ok, ${bad} blocked`);
-  return { exit: exit.name, engines: results };
-}
-
-async function fullProbe(exits: Exit[]): Promise<ExitProbe[]> {
-  return Promise.all(exits.map(exit => directProbeExit(exit)));
-}
-
 // ─── Route optimisation ─────────────────────────────────────
 
-function optimise(probes: ExitProbe[]): { assignments: Record<string, string>; defaultExit: string } {
+// Only probes of up tunnels are passed in; no probes means no default exit (fail closed)
+function optimise(probes: ExitProbe[]): { assignments: Record<string, string>; defaultExit: string | null } {
+  if (probes.length === 0) return { assignments: {}, defaultExit: null };
+
   const exitScores = new Map<string, number>();
   const engineExits = new Map<string, string[]>();
 
@@ -543,9 +799,9 @@ function optimise(probes: ExitProbe[]): { assignments: Record<string, string>; d
     exitScores.set(probe.exit, okCount);
   }
 
-  // Default exit = most working engines
-  let defaultExit = "tor";
-  let maxScore = 0;
+  // Default exit = most working engines (the tunnel itself works even if every engine blocks it)
+  let defaultExit = probes[0].exit;
+  let maxScore = -1;
   for (const [exit, score] of exitScores) {
     if (score > maxScore) {
       maxScore = score;
@@ -563,227 +819,185 @@ function optimise(probes: ExitProbe[]): { assignments: Record<string, string>; d
   return { assignments, defaultExit };
 }
 
-// ─── CLI commands ───────────────────────────────────────────
+// ─── Routing cycle ──────────────────────────────────────────
 
-async function initialProbeAndRoute(activeExits: Exit[]) {
-  const secretKey = await getSecretKey();
-  console.log("Running health probe (one SearXNG search per exit)...");
-  const probes = await fullProbe(activeExits);
+// Probes every engine through every up tunnel (in-container), picks routes, applies and reads them back
+async function routeCycle(exits: Exit[], reason: string): Promise<void> {
+  const up = exits.filter(e => isUp(e.name));
+  log(`routing (${reason}): probing ${ENGINE_URLS.length} engines through ${up.length} up tunnel(s)...`);
 
-  console.log("\nOptimising routes...");
-  const { assignments, defaultExit } = optimise(probes);
-  console.log(`  default: ${defaultExit}`);
-  for (const [eng, exit] of Object.entries(assignments)) {
-    console.log(`  ${eng} → ${exit}`);
-  }
-
-  console.log("\nApplying optimal routes...");
-  const yaml = settingsOptimal(secretKey, activeExits, assignments, defaultExit);
+  let probes: ExitProbe[] = [];
   try {
-    await applySettings(yaml);
-    if (await waitForReady()) {
-      console.log("✓ SearXNG running with optimal proxy routes\n");
-    } else {
-      console.log("⚠ SearXNG may not have started correctly\n");
-    }
-  } catch (e: any) {
-    console.log(`⚠ Could not push routes to container (${e.message}) - proxy routing still active\n`);
-  }
-
-  // Verify and re-route engines that fail on the default
-  console.log("Verifying...");
-  try {
-    const res = await fetch(`${SEARXNG_URL}/search?q=test&format=json`, {
-      signal: AbortSignal.timeout(PROBE_TIMEOUT),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const text = await res.text();
-    let data: { results?: unknown[]; unresponsive_engines?: [string, string][] };
-    try { data = JSON.parse(text); } catch { throw new Error("response not JSON"); }
-    const ok = new Set((data.results as { engine: string }[])?.map(r => r.engine) ?? []);
-    const blocked = data.unresponsive_engines ?? [];
-    console.log(`  ${ok.size} engines responding, ${blocked.length} unresponsive`);
-
-    let rerouted = false;
-    const savedProbes = (await loadHealthMatrix())?.probes ?? [];
-
-    for (const [name, reason] of blocked) {
-      if (assignments[name]) continue;
-      const engineProbes = probes.flatMap(p =>
-        p.engines.filter(e => e.engine === name && e.status === "ok").map(() => p.exit),
-      );
-      let alt = engineProbes.find(e => e !== defaultExit);
-      if (!alt && savedProbes.length > 0) {
-        for (const p of savedProbes) {
-          if (p.exit === defaultExit) continue;
-          if (p.engines.some(e => e.engine === name && e.status === "ok")) { alt = p.exit; break; }
-        }
-      }
-      if (alt) {
-        console.log(`    ✗ ${name}: ${reason} → re-routing to ${alt}`);
-        assignments[name] = alt;
-        rerouted = true;
-      } else if (reason.toLowerCase().includes("captcha")) {
-        console.log(`    ✗ ${name}: ${reason} → trying Tor circuit rotation`);
-        const torAlt = await rotateTorUntilQwantWorks();
-        if (torAlt) { assignments[name] = torAlt; rerouted = true; }
-        else console.log(`    ✗ ${name}: exhausted ${TOR_RETRY_MAX} circuit rotations`);
-      } else {
-        console.log(`    ✗ ${name}: ${reason} (no alternative)`);
-      }
-    }
-
-    if (rerouted) {
-      console.log("\n  Re-applying with corrected routes...");
-      const fixedYaml = settingsOptimal(secretKey, activeExits, assignments, defaultExit);
-      await applySettings(fixedYaml);
-      await waitForReady();
-      console.log("  ✓ Routes corrected");
-    }
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.log(`  ⚠ verification skipped: ${msg}`);
-    if (msg.includes("403"))
-      console.log("    SearXNG rate limiter blocked the verification query; routes are applied but unverified this cycle");
-  }
-
-  const matrix: HealthMatrix = {
-    timestamp: new Date().toISOString(),
-    probes,
-    assignments: { _default: defaultExit, ...assignments },
-  };
-  await writeFile(HEALTH_FILE, JSON.stringify(matrix, null, 2));
-  console.log(`\nHealth matrix saved to .runtime/health-matrix.json`);
-}
-
-async function cmdStart() {
-  await mkdir(RUNTIME_DIR, { recursive: true });
-
-  // Server starts immediately
-  startStatusServer();
-  console.log(`Dashboard: http://localhost:${PROXY_PORT}/stats\n`);
-
-  console.log("Discovering exits...");
-  const allExits = await discoverExits();
-  console.log(`  ${allExits.length} exits (1 Tor + ${allExits.length - 1} VPN)\n`);
-
-  // Check Tor
-  console.log("Checking Tor...");
-  if (await checkPort(TOR_PORT)) {
-    console.log(`  ✓ Tor SOCKS5 on port ${TOR_PORT}\n`);
-  } else {
-    console.log("  ⚠ Tor not running - start it: brew services start tor\n");
-  }
-
-  // Start VPN tunnels
-  console.log("Starting VPN tunnels...");
-  const activeExits = await startProxies(allExits);
-  console.log(`\n${activeExits.length} active exits\n`);
-
-  // Probe, optimise, verify - then monitor
-  await initialProbeAndRoute(activeExits);
-
-  let knownExits = await discoverExits();
-  let lastFullProbe = Date.now();
-  console.log(`Monitoring every ${MONITOR_INTERVAL / 1000}s (forced probe every ${FORCED_PROBE_INTERVAL / 60_000}m)... (Ctrl-C to stop)\n`);
-
-  while (true) {
-    await Bun.sleep(MONITOR_INTERVAL);
-    const ts = new Date().toISOString();
-
-    const freshExits = await discoverExits();
-    const oldNames = new Set(knownExits.filter(e => e.type === "vpn").map(e => e.name));
-    const newNames = new Set(freshExits.filter(e => e.type === "vpn").map(e => e.name));
-    const added = [...newNames].filter(n => !oldNames.has(n));
-    const removed = [...oldNames].filter(n => !newNames.has(n));
-    if (added.length > 0 || removed.length > 0) {
-      if (added.length > 0) console.log(`[${ts}] new configs: ${added.join(", ")}`);
-      if (removed.length > 0) console.log(`[${ts}] removed configs: ${removed.join(", ")}`);
-      await syncProxies(freshExits);
-      knownExits = freshExits;
-      console.log(`[${ts}] re-probing after config change`);
-      await cmdProbe();
-      lastFullProbe = Date.now();
-      continue;
-    }
-    knownExits = freshExits;
-
-    process.stdout.write(`[${ts}] tunnel check...`);
-    const revived = await restartDeadTunnels(knownExits);
-    if (revived > 0) {
-      console.log(` ${revived} tunnel(s) restarted - re-probing`);
-      await cmdProbe();
-      lastFullProbe = Date.now();
-      continue;
-    }
-    console.log(" tunnels ok");
-
-    const sinceLast = Date.now() - lastFullProbe;
-    if (sinceLast >= FORCED_PROBE_INTERVAL) {
-      console.log(`[${ts}] forced probe (${Math.round(sinceLast / 60_000)}m since last)`);
-      await cmdProbe();
-      lastFullProbe = Date.now();
-      continue;
-    }
-
-    process.stdout.write(`[${ts}] engine check...`);
-    try {
-      const res = await fetch(`${SEARXNG_URL}/config`, {
-        signal: AbortSignal.timeout(PROBE_TIMEOUT),
-      });
-      if (!res.ok) {
-        console.log(` ⚠ SearXNG HTTP ${res.status}`);
+    const results = await containerProbe(up, ENGINE_URLS);
+    for (const r of results) {
+      if (!r.trace.ok) {
+        // Died between the tunnel check and this probe
+        state.tunnels[r.name] = classifyTunnel(r.trace, null);
         continue;
       }
-      console.log(" ✓ SearXNG alive");
-    } catch (err: unknown) {
-      console.log(` ✗ ${err instanceof Error ? err.message : err}`);
+      probes.push({ exit: r.name, engines: r.engines ?? [] });
+      const ok = (r.engines ?? []).filter(e => e.status === "ok").length;
+      console.log(`  probed ${r.name}: ${ok} ok, ${(r.engines?.length ?? 0) - ok} not ok`);
     }
+  } catch (e: unknown) {
+    log(`✗ engine probe failed: ${e instanceof Error ? e.message : e}`);
+    probes = [];
+  }
+
+  // Engines no exit can serve, but which hit a CAPTCHA on Tor: try new Tor circuits
+  const tor = up.find(e => e.type === "tor");
+  const torProbe = probes.find(p => p.exit === "tor");
+  if (tor && torProbe) {
+    let rotations = 0;
+    for (const [engine] of ENGINE_URLS) {
+      if (rotations >= 2) break; // each rotation costs up to TOR_RETRY_MAX probes; keep a cycle well inside the watchdog
+      const anyOk = probes.some(p => p.engines.some(e => e.engine === engine && e.status === "ok"));
+      const idx = torProbe.engines.findIndex(e => e.engine === engine);
+      if (anyOk || idx < 0 || torProbe.engines[idx].status !== "captcha") continue;
+      rotations++;
+      const fixed = await rotateTorForEngine(tor, engine);
+      if (fixed) torProbe.engines[idx] = fixed;
+    }
+  }
+
+  const { assignments, defaultExit } = optimise(probes);
+  if (defaultExit) {
+    console.log(`  default: ${defaultExit}`);
+    for (const [eng, exit] of Object.entries(assignments)) console.log(`  ${eng} → ${exit}`);
+  } else {
+    console.log("  ✗ no tunnel carries data - routing to blackhole, search is blocked rather than sent directly");
+  }
+
+  const yaml = settingsOptimal(await getSecretKey(), exits, assignments, defaultExit);
+  const apply = await applySettings(yaml);
+  console.log(apply.ok ? `  ✓ settings ${apply.detail}` : `  ✗ settings NOT applied: ${apply.detail}`);
+
+  state = {
+    ...state,
+    timestamp: new Date().toISOString(),
+    probes,
+    assignments: defaultExit ? { _default: defaultExit, ...assignments } : {},
+    apply,
+  };
+  routingReady = apply.ok && defaultExit !== null;
+  await saveState();
+}
+
+// True when the applied routes use a tunnel that is no longer up, or an up tunnel is missing from the last probe
+function routesStale(exits: Exit[]): boolean {
+  const routed = new Set(Object.values(state.assignments));
+  if (routed.size === 0) return exits.some(e => isUp(e.name));
+  if ([...routed].some(name => !isUp(name))) return true;
+  const probed = new Set(state.probes.map(p => p.exit));
+  return exits.some(e => isUp(e.name) && !probed.has(e.name));
+}
+
+// ─── Watchdog ───────────────────────────────────────────────
+
+let lastLoopTick = Date.now();
+let lastWatchdogTimer = Date.now();
+
+// Timer path: a gap between our own ticks means the machine was suspended, not the loop - grant a fresh window
+function watchdogTimer(): void {
+  const now = Date.now();
+  if (now - lastWatchdogTimer > 180_000) lastLoopTick = now;
+  lastWatchdogTimer = now;
+  checkWatchdog();
+}
+
+function checkWatchdog(): void {
+  const stalled = Date.now() - lastLoopTick;
+  if (stalled < WATCHDOG_STALL_LIMIT) return;
+  log(`watchdog: monitor loop stalled ${Math.round(stalled / 60_000)}m - exiting for restart`);
+  stopAllTunnels().finally(() => process.exit(1));
+}
+
+// Sleep against the wall clock in short slices, so a timer lost across macOS sleep/wake cannot park the loop
+async function sleepWall(ms: number): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) await Bun.sleep(Math.min(SLEEP_SLICE, deadline - Date.now()));
+}
+
+// ─── CLI commands ───────────────────────────────────────────
+
+async function cmdStart() {
+  await mkdir(TUNNEL_LOG_DIR, { recursive: true });
+  state = { ...((await loadHealthMatrix()) ?? emptyMatrix()), apply: null };
+
+  // Server starts immediately; search through it stays closed until routes are applied
+  startStatusServer();
+  startTorRelay();
+  setInterval(watchdogTimer, 60_000);
+  console.log(`Dashboard: http://localhost:${PROXY_PORT}/stats\n`);
+
+  // Never let SearXNG run with a settings file that has no outgoing proxy (e.g. a fresh install's seed)
+  const current = await readContainerSettings();
+  if (current !== null && !current.includes("socks5h://")) {
+    log("container settings have no outgoing proxy - applying blackhole routes first");
+    const apply = await applySettings(settingsOptimal(await getSecretKey(), [], {}, null));
+    console.log(apply.ok ? `  ✓ ${apply.detail}` : `  ✗ ${apply.detail}`);
+  }
+
+  let exits = await discoverExits();
+  console.log(`Exits: ${exits.length} (1 Tor + ${exits.length - 1} VPN), tunnels bind ${TUNNEL_HOST}`);
+  console.log("Starting VPN tunnels...");
+  killOrphanTunnels();
+  await sweepRuntimeConfigs(exits);
+  await startTunnels(exits);
+
+  await exclusive(async () => {
+    await checkTunnels(exits, { restart: true });
+    await routeCycle(exits, "startup");
+  });
+  firstRouteDone = true;
+
+  let lastFullProbe = Date.now();
+  console.log(`\nMonitoring every ${MONITOR_INTERVAL / 1000}s (full engine probe every ${FORCED_PROBE_INTERVAL / 60_000}m or when routes go stale)\n`);
+
+  while (true) {
+    lastLoopTick = Date.now();
+    await sleepWall(MONITOR_INTERVAL);
+
+    const fresh = await discoverExits();
+    const before = exits.map(e => e.name).join();
+    const configsChanged = fresh.map(e => e.name).join() !== before;
+    if (configsChanged) {
+      log(`VPN configs changed (${exits.length - 1} → ${fresh.length - 1})`);
+      await syncTunnels(fresh);
+      exits = fresh;
+    }
+
+    await exclusive(async () => {
+      await checkTunnels(exits, { restart: true });
+      const forced = Date.now() - lastFullProbe >= FORCED_PROBE_INTERVAL;
+      const stale = routesStale(exits);
+      if (configsChanged || forced || stale || !routingReady) {
+        await routeCycle(exits, configsChanged ? "configs changed" : stale ? "routes stale" : !routingReady ? "not routing" : "scheduled");
+        lastFullProbe = Date.now();
+      }
+    });
   }
 }
 
 async function cmdStop() {
-  console.log("Stopping proxies...");
-  await stopProxies();
+  console.log("Stopping tunnels...");
+  await stopAllTunnels();
   console.log("Done.");
 }
 
+// One-off check and re-route from a second process: measures and re-routes, but does not own the tunnels
 async function cmdProbe() {
-  const exits = await discoverExits();
-  const checks = await Promise.all(exits.map(async (exit) => ({
-    exit,
-    alive: await checkPort(exit.port),
-  })));
-  const reachable = checks.filter(c => c.alive).map(c => c.exit);
-  for (const c of checks.filter(c => !c.alive)) {
-    console.log(`  skip ${c.exit.name} (port ${c.exit.port} unreachable)`);
-  }
-
-  if (reachable.length === 0) {
-    console.log("No active exits. Run: bun proxy-manager.ts start");
+  // A second process would race the running manager's container restarts
+  const running = await fetch(`http://127.0.0.1:${PROXY_PORT}/api/status`, { signal: AbortSignal.timeout(2000) })
+    .then(() => true, () => false);
+  if (running) {
+    console.log(`The manager is running and re-checks every ${MONITOR_INTERVAL / 60_000} minutes. Use the dashboard's reprobe, or restart it.`);
     return;
   }
-
-  const secretKey = await getSecretKey();
-  console.log(`Re-probing ${reachable.length} exits...`);
-  const probes = await fullProbe(reachable);
-  const { assignments, defaultExit } = optimise(probes);
-
-  const yaml = settingsOptimal(secretKey, exits, assignments, defaultExit);
-  try {
-    await applySettings(yaml);
-    await waitForReady();
-  } catch (e: any) {
-    console.log(`⚠ Could not push routes to container (${e.message})`);
-  }
-
-  const matrix: HealthMatrix = {
-    timestamp: new Date().toISOString(),
-    probes,
-    assignments: { _default: defaultExit, ...assignments },
-  };
-  await writeFile(HEALTH_FILE, JSON.stringify(matrix, null, 2));
-  console.log("✓ Routes updated");
+  state = (await loadHealthMatrix()) ?? emptyMatrix();
+  const exits = await discoverExits();
+  await checkTunnels(exits, { restart: false });
+  await routeCycle(exits, "manual probe");
 }
 
 async function cmdStatus() {
@@ -792,7 +1006,16 @@ async function cmdStatus() {
     console.log("No health matrix. Run: bun proxy-manager.ts start");
     return;
   }
-  console.log(`Last probe: ${matrix.timestamp}\n`);
+
+  console.log("Tunnels (data path through SearXNG's client):");
+  for (const [name, t] of Object.entries(matrix.tunnels).sort()) {
+    const age = Math.round((Date.now() - new Date(t.checkedAt).getTime()) / 60_000);
+    console.log(`  ${name.padEnd(12)} ${t.status.padEnd(11)} ${(t.exitIp ?? "").padEnd(16)} ${(t.loc ?? "").padEnd(3)} ${age}m ago${t.detail ? `  ${t.detail}` : ""}`);
+  }
+  if (matrix.apply) {
+    console.log(`\nSettings: ${matrix.apply.ok ? "applied" : "NOT APPLIED"} (${matrix.apply.detail}) at ${matrix.apply.at}`);
+  }
+  console.log(`Last engine probe: ${matrix.timestamp || "never"}\n`);
 
   const allEngines = new Set<string>();
   for (const p of matrix.probes) for (const e of p.engines) allEngines.add(e.engine);
@@ -825,7 +1048,7 @@ async function cmdStatus() {
 
   console.log("\nAssignments:");
   const def = matrix.assignments._default;
-  console.log(`  (default) → ${def}`);
+  console.log(`  (default) → ${def ?? "none (blackhole)"}`);
   for (const [eng, exit] of Object.entries(matrix.assignments)) {
     if (eng !== "_default") console.log(`  ${eng} → ${exit}`);
   }
@@ -834,6 +1057,13 @@ async function cmdStatus() {
 // ─── Single-engine reprobe ─────────────────────────────────
 
 async function reprobeEngine(url: URL): Promise<Response> {
+  if (!firstRouteDone || lockHeld) {
+    return Response.json({ ok: false, error: "busy: a tunnel check or routing cycle is running" }, { status: 409 });
+  }
+  return exclusive(() => reprobeEngineLocked(url));
+}
+
+async function reprobeEngineLocked(url: URL): Promise<Response> {
   const engine = url.searchParams.get("engine");
   if (!engine) {
     return Response.json({ ok: false, error: "missing engine param" }, { status: 400 });
@@ -845,76 +1075,64 @@ async function reprobeEngine(url: URL): Promise<Response> {
   }
 
   const exits = await discoverExits();
-  const checks = await Promise.all(exits.map(async (exit) => ({
-    exit,
-    alive: await checkPort(exit.port),
-  })));
-  const reachable = checks.filter(c => c.alive).map(c => c.exit);
-
-  if (reachable.length === 0) {
-    return Response.json({ ok: false, error: "no reachable exits" });
+  const up = exits.filter(e => isUp(e.name));
+  if (up.length === 0) {
+    return Response.json({ ok: false, error: "no tunnel is carrying data" });
   }
 
-  const results = await Promise.all(
-    reachable.map(async (exit) => {
-      const result = await directProbeEngine(engine, engineUrl, exit.port);
-      return { exit: exit.name, result };
-    }),
-  );
+  let results: ProbeOutput[];
+  try {
+    results = await containerProbe(up, [[engine, engineUrl]]);
+  } catch (e: unknown) {
+    return Response.json({ ok: false, error: `probe failed: ${e instanceof Error ? e.message : e}` });
+  }
 
-  const working = results.filter(r => r.result.status === "ok");
+  const working = results.filter(r => r.engines?.[0]?.status === "ok").map(r => r.name);
   console.log(`[reprobe] ${engine}: ${working.length}/${results.length} exits ok`);
 
-  let matrix: HealthMatrix;
-  try {
-    matrix = JSON.parse(await readFile(HEALTH_FILE, "utf-8"));
-  } catch {
-    return Response.json({ ok: false, error: "no health matrix" });
-  }
-
   // Update engine status in existing probes
-  for (const { exit, result } of results) {
-    const probe = matrix.probes.find(p => p.exit === exit);
-    if (!probe) continue;
+  for (const r of results) {
+    const result = r.engines?.[0];
+    const probe = state.probes.find(p => p.exit === r.name);
+    if (!probe || !result) continue;
     const idx = probe.engines.findIndex(e => e.engine === engine);
     if (idx >= 0) probe.engines[idx] = result;
     else probe.engines.push(result);
   }
 
-  const defaultExit = matrix.assignments._default ?? "tor";
+  const defaultExit = state.assignments._default ?? null;
   let assignedExit: string | null = null;
 
-  if (working.length > 0) {
-    const defaultWorks = working.some(w => w.exit === defaultExit);
-    if (defaultWorks) {
-      delete matrix.assignments[engine];
+  if (working.length > 0 && defaultExit) {
+    if (working.includes(defaultExit)) {
+      delete state.assignments[engine];
       assignedExit = defaultExit;
     } else {
-      matrix.assignments[engine] = working[0].exit;
-      assignedExit = working[0].exit;
+      state.assignments[engine] = working[0];
+      assignedExit = working[0];
     }
 
-    const secretKey = await getSecretKey();
-    const { _default, ...engineAssignments } = matrix.assignments;
-    const yaml = settingsOptimal(secretKey, exits, engineAssignments, defaultExit);
-    try {
-      await applySettings(yaml);
-      await waitForReady();
-    } catch (e: any) {
-      console.log(`⚠ Could not push routes to container (${e.message})`);
-    }
+    const { _default, ...engineAssignments } = state.assignments;
+    const apply = await applySettings(settingsOptimal(await getSecretKey(), exits, engineAssignments, defaultExit));
+    state.apply = apply;
+    routingReady = apply.ok;
+    if (!apply.ok) console.log(`[reprobe] ✗ settings NOT applied: ${apply.detail}`);
   }
-
-  matrix.timestamp = new Date().toISOString();
-  await writeFile(HEALTH_FILE, JSON.stringify(matrix, null, 2));
+  await saveState();
 
   if (working.length === 0) {
     return Response.json({ ok: false, error: `${engine}: no working exit found` });
   }
-  return Response.json({ ok: true, engine, exit: assignedExit });
+  return Response.json({ ok: state.apply?.ok ?? false, engine, exit: assignedExit });
 }
 
 // ─── Status dashboard ──────────────────────────────────────
+
+function gateMessage(): string {
+  if (!state.apply) return "Routes are not applied yet - the first tunnel probe is still running.";
+  if (!state.apply.ok) return `Routing settings failed to apply: ${state.apply.detail}`;
+  return "No VPN tunnel is carrying traffic, so search is blocked rather than sent from this machine's own IP.";
+}
 
 function startStatusServer() {
   Bun.serve({
@@ -922,6 +1140,7 @@ function startStatusServer() {
     hostname: "127.0.0.1",
     idleTimeout: 255,
     async fetch(req) {
+      checkWatchdog();
       const url = new URL(req.url);
 
       if (url.pathname === "/stats" || url.pathname === "/stats/") {
@@ -934,7 +1153,21 @@ function startStatusServer() {
         return statusLog(url);
       }
       if (url.pathname === "/api/reprobe" && req.method === "POST") {
+        // Only the dashboard itself may trigger a reprobe (it restarts the container); block cross-site posts
+        const site = req.headers.get("sec-fetch-site");
+        const origin = req.headers.get("origin");
+        const sameOrigin = origin === null || origin === `http://localhost:${PROXY_PORT}` || origin === `http://127.0.0.1:${PROXY_PORT}`;
+        if ((site && site !== "same-origin" && site !== "none") || !sameOrigin) {
+          return Response.json({ ok: false, error: "cross-origin request refused" }, { status: 403 });
+        }
         return reprobeEngine(url);
+      }
+
+      if (!routingReady) {
+        return new Response(`SearXNG-Local: search unavailable. ${gateMessage()}\nStatus: http://localhost:${PROXY_PORT}/stats\n`, {
+          status: 503,
+          headers: { "Content-Type": "text/plain; charset=utf-8", "Retry-After": "60" },
+        });
       }
 
       // Reverse-proxy everything else to SearXNG
@@ -964,67 +1197,70 @@ function startStatusServer() {
   console.log(`Proxy listening on http://localhost:${PROXY_PORT}/ (SearXNG on :${SEARXNG_INTERNAL_PORT}, /stats → dashboard)\n`);
 }
 
-const LOG_FILE = join(RUNTIME_DIR, "proxy-watch.log");
-
 async function statusLog(url: URL): Promise<Response> {
   const lines = parseInt(url.searchParams.get("lines") ?? "50", 10);
   try {
     const content = await readFile(LOG_FILE, "utf-8");
-    const allLines = content.split("\n");
-    const tail = allLines.slice(-Math.min(lines, 200)).join("\n");
+    const allLines = content.replace(/\n$/, "").split("\n");
+    const tail = allLines.slice(-Math.min(lines, 200)).join("\n") + "\n";
     return new Response(tail, {
-      headers: { "Content-Type": "text/plain; charset=utf-8", "Access-Control-Allow-Origin": "*" },
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
     });
   } catch {
-    return new Response("No log file yet.\n", {
+    return new Response(`No log file yet (${LOG_FILE}).\n`, {
       headers: { "Content-Type": "text/plain; charset=utf-8" },
     });
   }
 }
 
-async function getTunnelStatus(): Promise<{ name: string; country: string; port: number; alive: boolean }[]> {
+interface TunnelRow { name: string; country: string; status: TunnelStatus | "unchecked"; exitIp: string; loc: string; ageMin: number | null; detail: string }
+
+async function getTunnelStatus(): Promise<TunnelRow[]> {
   const exits = await discoverExits();
-  return Promise.all(exits.map(async (exit) => {
-    const alive = await checkPort(exit.port);
+  return exits.map(exit => {
+    const t = state.tunnels[exit.name];
     const country = exit.country ? (COUNTRY_NAMES[exit.country] ?? exit.country) : (exit.type === "tor" ? "Tor network" : "-");
-    return { name: exit.name, country, port: exit.port, alive };
-  }));
-}
-
-async function loadHealthMatrix(): Promise<HealthMatrix | null> {
-  try { return JSON.parse(await readFile(HEALTH_FILE, "utf-8")); } catch { return null; }
-}
-
-async function statusJson(): Promise<Response> {
-  const [matrix, tunnels] = await Promise.all([loadHealthMatrix(), getTunnelStatus()]);
-  return Response.json({ matrix, tunnels }, {
-    headers: { "Access-Control-Allow-Origin": "*" },
+    return {
+      name: exit.name,
+      country,
+      status: t?.status ?? "unchecked",
+      exitIp: t?.exitIp ?? "",
+      loc: t?.loc ?? "",
+      ageMin: t ? Math.round((Date.now() - new Date(t.checkedAt).getTime()) / 60_000) : null,
+      detail: t?.detail ?? "",
+    };
   });
 }
 
-async function statusPage(): Promise<Response> {
-  const [matrix, tunnels] = await Promise.all([loadHealthMatrix(), getTunnelStatus()]);
+async function statusJson(): Promise<Response> {
+  const tunnels = await getTunnelStatus();
+  return Response.json({ matrix: state, tunnels, routingReady, gate: routingReady ? null : gateMessage() });
+}
 
-  const defaultExit = matrix?.assignments._default ?? "unknown";
-  const assignments = matrix?.assignments ?? {};
+function esc(s: string): string {
+  return s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
+}
+
+async function statusPage(): Promise<Response> {
+  const matrix = state;
+  const tunnels = await getTunnelStatus();
+
+  const defaultExit = matrix.assignments._default ?? "none";
+  const assignments = matrix.assignments;
 
   // Build engine list with routes
   const allEngines = new Set<string>();
-  if (matrix) {
-    for (const p of matrix.probes) for (const e of p.engines) allEngines.add(e.engine);
-  }
+  for (const p of matrix.probes) for (const e of p.engines) allEngines.add(e.engine);
   const engines = [...allEngines].sort();
 
   // Build lookup for the health grid
   const lookup = new Map<string, Map<string, EngineResult>>();
-  if (matrix) {
-    for (const probe of matrix.probes) {
-      const m = new Map<string, EngineResult>();
-      for (const e of probe.engines) m.set(e.engine, e);
-      lookup.set(probe.exit, m);
-    }
+  for (const probe of matrix.probes) {
+    const m = new Map<string, EngineResult>();
+    for (const e of probe.engines) m.set(e.engine, e);
+    lookup.set(probe.exit, m);
   }
-  const exitNames = matrix?.probes.map(p => p.exit) ?? [];
+  const exitNames = matrix.probes.map(p => p.exit);
   const issueCount = engines.filter(eng => {
     const route = assignments[eng] ?? defaultExit;
     return lookup.get(route)?.get(eng)?.status !== "ok";
@@ -1032,15 +1268,21 @@ async function statusPage(): Promise<Response> {
 
   let totalEnabled = 0;
   try {
-    const res = await fetch(`http://127.0.0.1:${SEARXNG_INTERNAL_PORT}/config`);
+    const res = await fetch(`http://127.0.0.1:${SEARXNG_INTERNAL_PORT}/config`, { signal: AbortSignal.timeout(3000) });
     const cfg = await res.json() as { engines?: { enabled?: boolean }[] };
     totalEnabled = (cfg.engines ?? []).filter((e: { enabled?: boolean }) => e.enabled !== false).length;
   } catch { /* SearXNG not ready yet */ }
   const activeCount = totalEnabled > 0 ? totalEnabled - issueCount : 0;
 
-  const probeAge = matrix
+  const probeAge = matrix.timestamp
     ? Math.round((Date.now() - new Date(matrix.timestamp).getTime()) / 60_000)
     : null;
+  const upCount = tunnels.filter(t => t.status === "up").length;
+  const apply = matrix.apply;
+  const applyText = !apply ? "not applied yet"
+    : apply.ok ? `applied ${Math.round((Date.now() - new Date(apply.at).getTime()) / 60_000)}m ago`
+    : `FAILED: ${esc(apply.detail)}`;
+  const statusRank: Record<string, number> = { down: 0, bypass: 1, unverified: 2, unchecked: 3, up: 4 };
 
   const html = `<!doctype html>
 <html lang="en">
@@ -1054,6 +1296,7 @@ async function statusPage(): Promise<Response> {
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--fg); padding: 1.5rem; max-width: 1400px; margin: 0 auto; }
   h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
   .subtitle { color: var(--muted); font-size: 0.85rem; margin-bottom: 1.5rem; }
+  .banner { background: rgba(248,81,73,0.12); border: 1px solid var(--bad); color: var(--fg); border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1.5rem; font-size: 0.9rem; }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 1.5rem; }
   @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
   .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; }
@@ -1066,8 +1309,9 @@ async function statusPage(): Promise<Response> {
   .warn { color: var(--warn); }
   .muted { color: var(--muted); }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
-  .dot.alive { background: var(--ok); }
-  .dot.dead { background: var(--bad); }
+  .dot.up { background: var(--ok); }
+  .dot.down, .dot.bypass { background: var(--bad); }
+  .dot.unverified, .dot.unchecked { background: var(--warn); }
   .tag { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.75rem; font-weight: 500; }
   .tag.default { background: rgba(88,166,255,0.15); color: var(--accent); }
   .tag.routed { background: rgba(63,185,80,0.15); color: var(--ok); }
@@ -1084,7 +1328,8 @@ async function statusPage(): Promise<Response> {
 </head>
 <body>
 <h1>SearXNG Proxy Status <span class="muted" style="font-size:0.5em; font-weight:normal">v${VERSION}</span></h1>
-<p class="subtitle">Last probe: ${probeAge !== null ? `${probeAge}m ago` : "never"} &bull; Default exit: <strong>${defaultExit}</strong> &bull; Active engines: <strong>${activeCount}/${totalEnabled}</strong> <a class="refresh" onclick="location.reload()">refresh</a></p>
+<p class="subtitle">Tunnels carrying data: <strong>${upCount}/${tunnels.length}</strong> &bull; Default exit: <strong>${esc(defaultExit)}</strong> &bull; Settings: <strong class="${apply?.ok ? "" : "bad"}">${applyText}</strong> &bull; Last engine probe: ${probeAge !== null ? `${probeAge}m ago` : "never"} &bull; Active engines: <strong>${activeCount}/${totalEnabled}</strong> <a class="refresh" onclick="location.reload()">refresh</a></p>
+${routingReady ? "" : `<div class="banner"><strong>Search is blocked.</strong> ${esc(gateMessage())}</div>`}
 
 <div class="grid">
   <div class="card">
@@ -1104,7 +1349,7 @@ async function statusPage(): Promise<Response> {
         const status = probe?.status ?? "unknown";
         const statusClass = status === "timeout" ? "warn" : status === "unknown" ? "muted" : "bad";
         const tagClass = isCustom ? "routed" : "default";
-        return `<tr class="engine-row"><td>${eng}</td><td><span class="tag ${tagClass}">${route}</span></td><td class="${statusClass}">${status}</td><td><button class="reprobe-btn" onclick="reprobe('${eng}', this)">reprobe</button></td></tr>`;
+        return `<tr class="engine-row"><td>${esc(eng)}</td><td><span class="tag ${tagClass}">${esc(route)}</span></td><td class="${statusClass}">${status}</td><td><button class="reprobe-btn" onclick="reprobe('${esc(eng)}', this)">reprobe</button></td></tr>`;
       }).join("\n      ") || '<tr><td colspan="4" class="ok">All engines routing OK</td></tr>'}
       </tbody>
     </table>
@@ -1119,14 +1364,15 @@ async function statusPage(): Promise<Response> {
   </div>
 
   <div class="card">
-    <h2>Tunnels <span class="muted" style="font-size:0.75em; font-weight:normal">(${tunnels.length})</span></h2>
+    <h2>Tunnels <span class="muted" style="font-size:0.75em; font-weight:normal">(data path through SearXNG's client)</span></h2>
     <div id="tunnel-container" style="min-height: 20rem;">
     <table>
-      <tr><th>Exit</th><th>Country</th><th>Port</th><th>Status</th></tr>
+      <tr><th>Exit</th><th>Country</th><th>Exit IP</th><th>Status</th><th>Checked</th></tr>
       <tbody id="tunnel-rows">
-      ${tunnels.sort((a, b) => a.country.localeCompare(b.country) || a.name.localeCompare(b.name, undefined, { numeric: true })).map(t =>
-        `<tr class="tunnel-row"><td><span class="dot ${t.alive ? "alive" : "dead"}"></span>${t.name}</td><td class="muted">${t.country}</td><td>${t.port}</td><td class="${t.alive ? "ok" : "bad"}">${t.alive ? "alive" : "dead"}</td></tr>`
-      ).join("\n      ")}
+      ${tunnels.sort((a, b) => (statusRank[a.status] - statusRank[b.status]) || a.country.localeCompare(b.country) || a.name.localeCompare(b.name, undefined, { numeric: true })).map(t => {
+        const cls = t.status === "up" ? "ok" : t.status === "unverified" || t.status === "unchecked" ? "warn" : "bad";
+        return `<tr class="tunnel-row" title="${esc(t.detail)}"><td><span class="dot ${t.status}"></span>${esc(t.name)}</td><td class="muted">${esc(t.country)}</td><td class="muted">${esc(t.exitIp)}${t.loc ? ` (${esc(t.loc)})` : ""}</td><td class="${cls}">${t.status}</td><td class="muted">${t.ageMin === null ? "-" : `${t.ageMin}m ago`}</td></tr>`;
+      }).join("\n      ")}
       </tbody>
     </table>
     </div>
@@ -1143,15 +1389,15 @@ async function statusPage(): Promise<Response> {
 <div class="card health-grid">
   <h2>Health Matrix</h2>
   <table>
-    <tr><th>Engine</th>${exitNames.map(e => `<th>${e}</th>`).join("")}</tr>
+    <tr><th>Engine</th>${exitNames.map(e => `<th>${esc(e)}</th>`).join("")}</tr>
     ${engines.map(eng => {
       const cells = exitNames.map(ex => {
         const er = lookup.get(ex)?.get(eng);
         if (!er) return `<td class="muted">-</td>`;
         if (er.status === "ok") return `<td class="ok">✓</td>`;
-        return `<td class="bad" title="${er.detail ?? er.status}">✗</td>`;
+        return `<td class="bad" title="${esc(er.detail ?? er.status)}">✗</td>`;
       }).join("");
-      return `<tr><td>${eng}</td>${cells}</tr>`;
+      return `<tr><td>${esc(eng)}</td>${cells}</tr>`;
     }).join("\n    ")}
   </table>
 </div>
@@ -1227,8 +1473,8 @@ function usage() {
 Commands:
   start   Start server, tunnels, probe, monitor (foreground)
   stop    Stop everything
-  probe   Re-probe and re-optimise (must be running)
-  status  Show current health matrix and routes
+  probe   Re-check tunnels and re-route (from a second shell)
+  status  Show tunnel health, health matrix and routes
 
 Prerequisites:
   wireproxy   go install github.com/windtf/wireproxy/cmd/wireproxy@latest
@@ -1238,22 +1484,27 @@ Prerequisites:
 `);
 }
 
-// Cleanup on exit
-process.on("SIGINT", async () => {
-  console.log("\nShutting down...");
-  await stopProxies();
-  process.exit(0);
-});
-process.on("SIGTERM", async () => {
-  await stopProxies();
-  process.exit(0);
-});
+export { proxyUrl, classifyTunnel, optimise, settingsOptimal, textSince, restartDue, BLACKHOLE_PROXY };
+export type { Exit, ExitProbe };
 
-const cmd = process.argv[2] ?? "help";
-switch (cmd) {
-  case "start": await cmdStart(); break;
-  case "stop": await cmdStop(); break;
-  case "probe": await cmdProbe(); break;
-  case "status": await cmdStatus(); break;
-  default: usage();
+if (import.meta.main) {
+  // Cleanup on exit
+  process.on("SIGINT", async () => {
+    console.log("\nShutting down...");
+    await stopAllTunnels();
+    process.exit(0);
+  });
+  process.on("SIGTERM", async () => {
+    await stopAllTunnels();
+    process.exit(0);
+  });
+
+  const cmd = process.argv[2] ?? "help";
+  switch (cmd) {
+    case "start": await cmdStart(); break;
+    case "stop": await cmdStop(); break;
+    case "probe": await cmdProbe(); break;
+    case "status": await cmdStatus(); break;
+    default: usage();
+  }
 }

@@ -10,6 +10,8 @@ echo "$(date '+%Y-%m-%d %H:%M:%S') searxng-start: begin"
 
 export PATH="/opt/homebrew/bin:${PATH}"
 export SEARXNG_SKIP_PROXY_WATCH=1
+# Tell the manager where its output lands, so the dashboard shows this log
+export SEARXNG_PROXY_LOG="${LOG_DIR}/searxng.log"
 
 cd "$SCRIPT_DIR"
 ./setup.sh setup

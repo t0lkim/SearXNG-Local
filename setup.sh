@@ -184,7 +184,14 @@ rt_create_seed() {
 
 rt_cp() {
   case "$RUNTIME" in
-    container) container copy "$1" "$2" ;;
+    # container copy exits 0 but misses volume mounts; stream through exec (container side is name:path)
+    container)
+      if [[ "$1" == *:* && "$1" != /* ]]; then
+        container exec "${1%%:*}" cat "${1#*:}" > "$2"
+      else
+        container exec -i "${2%%:*}" sh -c "cat > ${2#*:}" < "$1"
+      fi
+      ;;
     podman)    podman cp "$1" "$2" ;;
   esac
 }
@@ -451,7 +458,7 @@ start_proxy_watch() {
   local logfile="${SCRIPT_DIR}/.runtime/proxy-watch.log"
   mkdir -p "${SCRIPT_DIR}/.runtime"
   info "Starting proxy watch (log: .runtime/proxy-watch.log)..."
-  nohup bun "${SCRIPT_DIR}/proxy-manager.ts" start >> "$logfile" 2>&1 &
+  SEARXNG_PROXY_LOG="$logfile" nohup bun "${SCRIPT_DIR}/proxy-manager.ts" start >> "$logfile" 2>&1 &
   echo $! > "$PROXY_PID_FILE"
 }
 

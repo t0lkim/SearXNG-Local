@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.10.0] - 2026-09-25
+
+Tunnel health is now measured on the path search actually uses. Before this release the dashboard could show healthy routing while SearXNG had never sent a request through a tunnel.
+
+- **Changed:** Tunnels and engines are probed inside the SearXNG container with SearXNG's own HTTP client (`searx.network.client`), through the exact proxy URL written into `settings.yml`. One function builds that URL for both. The host-side `curl` probe is gone
+- **Changed:** A tunnel counts as up only when a request through it returns an exit IP. An exit IP equal to this machine's own IP is flagged `bypass` and never used. TCP-connect liveness is gone
+- **New:** Tunnels that carry no data are restarted, including frozen processes whose port still accepts connections. Restarts back off (monitor cycles 1, 2, 4, 8, then every 12, about an hour) because every restart opens a new session on the VPN account
+- **New:** Fail closed - with no usable tunnel, SearXNG is routed to a blackhole proxy and `:8080` returns 503 with the reason, instead of searching from your own IP. A proxy-less seed config is replaced with blackhole routes before tunnels start
+- **New:** Settings are read back from the container after every apply; only a byte-identical read-back counts as applied. Apply failures show on the dashboard instead of being logged and ignored
+- **New:** Each tunnel logs to `.runtime/logs/wp-<name>.log` (rotated at 1 MB). Previously wireproxy stderr went to a pipe that was abandoned after the handshake, losing its logs and risking a blocked tunnel once the pipe filled
+- **New:** Dashboard shows each tunnel's status, exit IP, country and check age; the activity log shows the file the running manager writes (`SEARXNG_PROXY_LOG`, set by both launchers)
+- **Removed:** Search-query verification as a health signal (it also tripped the SearXNG rate limiter)
+- **Fix:** Routing settings never reached the container under Apple `container` - `container copy` exits 0 but writes beneath the `/etc/searxng` volume mount, so SearXNG ran on its default (JSON disabled, no proxies). Settings are streamed in via `container exec -i`; same fix in `setup.sh` seeding
+- **Fix:** Under Apple `container`, tunnels bind to the vmnet gateway (host-only bridge, read from `container network list`) instead of loopback, which the container cannot reach; `host.containers.internal` is Podman-only. Podman behaviour unchanged
+- **Fix:** Monitor loop could park indefinitely after macOS sleep/wake. It now sleeps against the wall clock, a watchdog exits non-zero after 60 minutes without a tick, and the LaunchAgent restarts it (`KeepAlive.SuccessfulExit=false`); reinstall with `./setup.sh install-agent`
+- **Fix:** Tunnel configs and logs are written `0600` (configs hold private keys); only this project's wireproxy processes are killed on stop
+- **New:** Under Apple `container`, the manager relays the vmnet gateway's port 9050 to Tor on loopback, so SearXNG can use Tor without any `torrc` change
+- **Note:** Proton VPN plans cap simultaneous connections per account (10 on the plan tested). Every file in `vpn-configs/` holds one open connection, alongside your other devices; configs past the cap handshake but carry no data
+
 ## [0.9.1] - 2026-09-11
 
 - **Fix:** Replace all blocking `execSync` calls with async `execAsync` and `checkPort` helpers so the HTTP server stays responsive during probe cycles
