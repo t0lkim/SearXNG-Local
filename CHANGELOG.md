@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.12.1] - 2026-09-30
+
+- **Fix:** The dashboard no longer counts missing evidence as health. With no tunnel carrying data it showed "All engines routing OK" and "Active engines 92/92". Engine status now comes only from engines whose routed exit is up now and whose last probe on that exit passed; with no tunnel up it says no engine can be routed. The count covers the 13 probed engines ("Engines verified X/13"), not SearXNG's whole engine list
+- **Fix:** No default route is now "offline", not a UDP-blocking network. Detection used to run while the Mac had no network and record every port as blocked, and detections that spanned a network coming up produced mixed results that moved tunnels off UDP 53. Offline skips detection and keeps the port; a detection whose network changed mid-probe is discarded and repeated
+- **Fix:** The network label no longer implies tunnels run on a port when no port gets through
+
 ## [0.12.0] - 2026-09-30
 
 - **New:** Tunnels run on UDP 53 by default. Networks that restrict UDP almost always leave DNS open, so tunnels on 53 keep working if such a filter switches on mid-session. Proton accepts WireGuard on 53 with the same configs

@@ -1,7 +1,7 @@
 // Run with: SEARXNG_RUNTIME=podman bun test
 // (forces the Podman addressing path so tests never call the container CLI)
 import { expect, test } from "bun:test";
-import { proxyUrl, classifyTunnel, optimise, settingsOptimal, textSince, restartDue, parseRuntimeStatus, BLACKHOLE_PROXY, type Exit } from "./proxy-manager.ts";
+import { proxyUrl, classifyTunnel, optimise, settingsOptimal, textSince, restartDue, parseRuntimeStatus, engineHealth, BLACKHOLE_PROXY, type Exit } from "./proxy-manager.ts";
 
 const exits: Exit[] = [
   { name: "tor", type: "tor", port: 9050 },
@@ -89,4 +89,29 @@ test("runtime status: down only when status says so, running only when it says s
   expect(parseRuntimeStatus(0, "")).toBe("unknown");
   expect(parseRuntimeStatus(1, "XPC connection error: Connection invalid")).toBe("unknown");
   expect(parseRuntimeStatus(1, "status              running")).toBe("unknown");
+});
+
+test("engine health: no tunnel up means no engine is OK, never 'all OK'", () => {
+  const matrix = { timestamp: "", probes: [], assignments: {}, tunnels: {}, apply: null };
+  const h = engineHealth(matrix, new Set());
+  expect(h.noRoute).toBe(true);
+  expect(h.ok).toBe(0);
+  expect(h.issues.length).toBe(h.total);
+});
+
+test("engine health: an engine routed to an exit that is now down is not OK, even if it probed OK", () => {
+  const matrix = {
+    timestamp: "", tunnels: {}, apply: null,
+    assignments: { _default: "de-1" },
+    probes: [{ exit: "de-1", engines: [{ engine: "brave", status: "ok" as const }] }],
+  };
+  expect(engineHealth(matrix, new Set(["de-1"])).issues.find(i => i.engine === "brave")).toBeUndefined();
+  expect(engineHealth(matrix, new Set(["fr-2"])).issues.find(i => i.engine === "brave")?.status).toBe("exit down");
+});
+
+test("engine health: engines never probed are 'not probed', not OK", () => {
+  const matrix = { timestamp: "", tunnels: {}, apply: null, assignments: { _default: "de-1" }, probes: [{ exit: "de-1", engines: [] }] };
+  const h = engineHealth(matrix, new Set(["de-1"]));
+  expect(h.ok).toBe(0);
+  expect(h.issues.every(i => i.status === "not probed")).toBe(true);
 });

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { PORT_LADDER, classify, networkKey, parseDigAnswer, withEndpointPort } from "./udp-network.ts";
+import { PORT_LADDER, classify, isOnline, networkKey, parseDigAnswer, withEndpointPort } from "./udp-network.ts";
 
 const all = (v: boolean) => Object.fromEntries(PORT_LADDER.map(p => [p, v]));
 
@@ -45,4 +45,10 @@ test("a new DHCP address on the same gateway counts as a new network", () => {
   const a = { iface: "en0", gateway: "gw", localIp: "a", mac: "m" };
   expect(networkKey(a)).not.toBe(networkKey({ ...a, localIp: "b" }));
   expect(networkKey(a)).toBe(networkKey({ ...a, mac: "other" }));
+});
+
+test("no default route is offline, not a blocking network", () => {
+  expect(isOnline({ iface: "en0", gateway: null, localIp: null, mac: "m" })).toBe(false);
+  expect(isOnline({ iface: "en0", gateway: "gw", localIp: null, mac: "m" })).toBe(false);
+  expect(isOnline({ iface: "en0", gateway: "gw", localIp: "a", mac: "m" })).toBe(true);
 });

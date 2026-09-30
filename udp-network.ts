@@ -15,7 +15,7 @@ const HANDSHAKE_WAIT = 5_000;
 const NO_DNS_ADDRESS = "198.51.100.1";
 
 export interface NetInfo { iface: string | null; gateway: string | null; localIp: string | null; mac: string | null }
-export type NetClass = "open" | "dns-only" | "restricted" | "blocked";
+export type NetClass = "open" | "dns-only" | "restricted" | "blocked" | "offline";
 
 export interface Detection {
   at: string;
@@ -42,6 +42,11 @@ export async function currentNetwork(): Promise<NetInfo> {
   const localIp = iface ? (await out(["ipconfig", "getifaddr", iface])).trim() || null : null;
   const mac = iface ? (await out(["ifconfig", iface])).match(/ether\s+([0-9a-f:]{17})/i)?.[1] ?? null : null;
   return { iface, gateway, localIp, mac };
+}
+
+// No default route means no network at all: probing then would record "blocked" for a network that does not exist
+export function isOnline(n: NetInfo): boolean {
+  return Boolean(n.gateway && n.localIp);
 }
 
 // Same network means same gateway and same local address; a new DHCP lease with a new address counts as a change

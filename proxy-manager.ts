@@ -6,9 +6,9 @@ import { createServer, connect } from "node:net";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { aiEnabled, handleAiStatus, handleOverview, injectPanel, setAiRuntimeDir } from "./ai-overview.ts";
-import { PORT_LADDER, currentNetwork, detectPorts, networkKey, recordEvidence, withEndpointPort, type Detection, type NetInfo } from "./udp-network.ts";
+import { PORT_LADDER, currentNetwork, detectPorts, isOnline, networkKey, recordEvidence, withEndpointPort, type Detection, type NetInfo } from "./udp-network.ts";
 
-const VERSION = "0.12.0";
+const VERSION = "0.12.1";
 
 const ROOT = import.meta.dir;
 const VPN_DIR = join(ROOT, "vpn-configs");
@@ -676,13 +676,31 @@ let anyVpnWasUp = false;
 async function redetect(exits: Exit[], reason: string): Promise<void> {
   const vpn = exits.filter(e => e.type === "vpn" && e.configFile);
   if (vpn.length === 0) return;
-  await stopAllTunnels();
   const info = await currentNetwork();
+  const key = networkKey(info);
+  if (!isOnline(info)) {
+    // Offline is not a filtering network: record it, keep the current port, and detect once a network appears
+    const d: Detection = { at: new Date().toISOString(), ports: {}, dnsIntercepted: null, netClass: "offline", chosenPort: null };
+    state.network = { key, joinedAt: new Date().toISOString(), tunnelPort, detection: d };
+    log(`no network (no default route) - not detecting (${reason})`);
+    await recordEvidence(EVIDENCE_FILE, "offline", info, { reason });
+    await saveState();
+    return;
+  }
+  await stopAllTunnels();
   log(`detecting UDP (${reason}) on ${info.iface ?? "?"} via ${vpn[0].name}...`);
   const wg = await readFile(vpn[0].configFile!, "utf-8");
   const d = await detectPorts(wgToWireproxyConfig(wg, 0), WP_BIN, RUNTIME_DIR);
+  const after = await currentNetwork();
+  if (networkKey(after) !== key) {
+    // The network changed while probing: these results describe neither network, so discard them
+    log(`network changed during detection - discarding results, will detect again`);
+    await recordEvidence(EVIDENCE_FILE, "detect-discarded", after, { reason, before: key });
+    lastDetectAt = 0;
+    await startTunnels(exits);
+    return;
+  }
   if (d.chosenPort !== null) tunnelPort = d.chosenPort;
-  const key = networkKey(info);
   state.network = {
     key,
     joinedAt: state.network?.key === key ? state.network.joinedAt : new Date().toISOString(),
@@ -1403,6 +1421,24 @@ function esc(s: string): string {
   return s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
 }
 
+// Engine health from evidence only: an engine is OK when its routed exit is up now and its last probe on
+// that exit passed. No evidence is never OK. Covers the engines this manager probes, not SearXNG's whole list.
+interface EngineIssue { engine: string; route: string; status: string; custom: boolean }
+function engineHealth(matrix: HealthMatrix, up: Set<string>): { ok: number; total: number; issues: EngineIssue[]; noRoute: boolean } {
+  const names = ENGINE_URLS.map(([e]) => e);
+  const defaultExit = matrix.assignments._default;
+  const noRoute = !defaultExit || !up.has(defaultExit);
+  const issues: EngineIssue[] = [];
+  for (const engine of names) {
+    const route = matrix.assignments[engine] ?? defaultExit ?? "none";
+    const custom = engine in matrix.assignments;
+    if (!up.has(route)) { issues.push({ engine, route, status: "exit down", custom }); continue; }
+    const result = matrix.probes.find(p => p.exit === route)?.engines.find(e => e.engine === engine);
+    if (result?.status !== "ok") issues.push({ engine, route, status: result?.status ?? "not probed", custom });
+  }
+  return { ok: names.length - issues.length, total: names.length, issues, noRoute };
+}
+
 async function statusPage(): Promise<Response> {
   const matrix = state;
   const tunnels = await getTunnelStatus();
@@ -1423,10 +1459,7 @@ async function statusPage(): Promise<Response> {
     lookup.set(probe.exit, m);
   }
   const exitNames = matrix.probes.map(p => p.exit);
-  const issueCount = engines.filter(eng => {
-    const route = assignments[eng] ?? defaultExit;
-    return lookup.get(route)?.get(eng)?.status !== "ok";
-  }).length;
+  const health = engineHealth(matrix, new Set(tunnels.filter(t => t.status === "up").map(t => t.name)));
 
   let totalEnabled = 0;
   try {
@@ -1434,7 +1467,6 @@ async function statusPage(): Promise<Response> {
     const cfg = await res.json() as { engines?: { enabled?: boolean }[] };
     totalEnabled = (cfg.engines ?? []).filter((e: { enabled?: boolean }) => e.enabled !== false).length;
   } catch { /* SearXNG not ready yet */ }
-  const activeCount = totalEnabled > 0 ? totalEnabled - issueCount : 0;
 
   const probeAge = matrix.timestamp
     ? Math.round((Date.now() - new Date(matrix.timestamp).getTime()) / 60_000)
@@ -1446,7 +1478,7 @@ async function statusPage(): Promise<Response> {
     : `FAILED: ${esc(apply.detail)}`;
   const det = matrix.network?.detection;
   const netText = det
-    ? `${det.netClass} · UDP ${matrix.network!.tunnelPort}${det.dnsIntercepted ? " · DNS intercepted" : ""} · checked ${Math.round((Date.now() - new Date(det.at).getTime()) / 60_000)}m ago`
+    ? `${det.netClass === "offline" ? "offline · no network" : det.netClass === "blocked" ? "blocked · no UDP port reaches the VPN servers" : `${det.netClass} · UDP ${matrix.network!.tunnelPort}`}${det.dnsIntercepted ? " · DNS intercepted" : ""} · checked ${Math.round((Date.now() - new Date(det.at).getTime()) / 60_000)}m ago`
     : "not detected yet";
   const statusRank: Record<string, number> = { down: 0, bypass: 1, unverified: 2, unchecked: 3, up: 4 };
 
@@ -1494,7 +1526,7 @@ async function statusPage(): Promise<Response> {
 </head>
 <body>
 <h1>SearXNG Proxy Status <span class="muted" style="font-size:0.5em; font-weight:normal">v${VERSION}</span></h1>
-<p class="subtitle">Network: <strong>${esc(netText)}</strong> &bull; Tunnels carrying data: <strong>${upCount}/${tunnels.length}</strong> &bull; Default exit: <strong>${esc(defaultExit)}</strong> &bull; Settings: <strong class="${apply?.ok ? "" : "bad"}">${applyText}</strong> &bull; Last engine probe: ${probeAge !== null ? `${probeAge}m ago` : "never"} &bull; Active engines: <strong>${activeCount}/${totalEnabled}</strong> <a class="refresh" onclick="location.reload()">refresh</a></p>
+<p class="subtitle">Network: <strong>${esc(netText)}</strong> &bull; Tunnels carrying data: <strong>${upCount}/${tunnels.length}</strong> &bull; Default exit: <strong>${esc(defaultExit)}</strong> &bull; Settings: <strong class="${apply?.ok ? "" : "bad"}">${applyText}</strong> &bull; Last engine probe: ${probeAge !== null ? `${probeAge}m ago` : "never"} &bull; Engines verified: <strong class="${health.ok === health.total ? "" : "bad"}">${health.ok}/${health.total}</strong>${totalEnabled ? ` (${totalEnabled} enabled, others not probed)` : ""} <a class="refresh" onclick="location.reload()">refresh</a></p>
 ${routingReady ? "" : `<div class="banner"><strong>Search is blocked.</strong> ${esc(gateMessage())}</div>`}
 
 <div class="grid">
@@ -1504,19 +1536,12 @@ ${routingReady ? "" : `<div class="banner"><strong>Search is blocked.</strong> $
     <table>
       <tr><th>Engine</th><th>Exit</th><th>Status</th><th></th></tr>
       <tbody id="engine-rows">
-      ${engines.filter(eng => {
-        const route = assignments[eng] ?? defaultExit;
-        const probe = lookup.get(route)?.get(eng);
-        return probe?.status !== "ok";
-      }).map(eng => {
-        const route = assignments[eng] ?? defaultExit;
-        const isCustom = eng in assignments && eng !== "_default";
-        const probe = lookup.get(route)?.get(eng);
-        const status = probe?.status ?? "unknown";
-        const statusClass = status === "timeout" ? "warn" : status === "unknown" ? "muted" : "bad";
-        const tagClass = isCustom ? "routed" : "default";
-        return `<tr class="engine-row"><td>${esc(eng)}</td><td><span class="tag ${tagClass}">${esc(route)}</span></td><td class="${statusClass}">${status}</td><td><button class="reprobe-btn" onclick="reprobe('${esc(eng)}', this)">reprobe</button></td></tr>`;
-      }).join("\n      ") || '<tr><td colspan="4" class="ok">All engines routing OK</td></tr>'}
+      ${health.noRoute
+        ? '<tr><td colspan="4" class="bad">No tunnel is carrying data, so no engine can be routed.</td></tr>'
+        : health.issues.map(i => {
+        const statusClass = i.status === "timeout" ? "warn" : i.status === "not probed" ? "muted" : "bad";
+        return `<tr class="engine-row"><td>${esc(i.engine)}</td><td><span class="tag ${i.custom ? "routed" : "default"}">${esc(i.route)}</span></td><td class="${statusClass}">${esc(i.status)}</td><td><button class="reprobe-btn" onclick="reprobe('${esc(i.engine)}', this)">reprobe</button></td></tr>`;
+      }).join("\n      ") || `<tr><td colspan="4" class="ok">All ${health.total} probed engines routing OK</td></tr>`}
       </tbody>
     </table>
     </div>
@@ -1650,7 +1675,7 @@ Prerequisites:
 `);
 }
 
-export { proxyUrl, classifyTunnel, optimise, settingsOptimal, textSince, restartDue, parseRuntimeStatus, BLACKHOLE_PROXY };
+export { proxyUrl, classifyTunnel, optimise, settingsOptimal, textSince, restartDue, parseRuntimeStatus, engineHealth, BLACKHOLE_PROXY };
 export type { Exit, ExitProbe };
 
 if (import.meta.main) {
