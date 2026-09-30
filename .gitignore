@@ -14,3 +14,6 @@ dev.t0lkim.searxng.plist
 
 # Retired WireGuard configs contain private keys — never commit
 pulled-configs/
+
+# Machine-local settings (AI provider choice etc.)
+local.env

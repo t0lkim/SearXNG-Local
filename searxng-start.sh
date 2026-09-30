@@ -14,6 +14,8 @@ export SEARXNG_SKIP_PROXY_WATCH=1
 export SEARXNG_PROXY_LOG="${LOG_DIR}/searxng.log"
 
 cd "$SCRIPT_DIR"
+# Machine-local settings (e.g. SEARXNG_AI_PROVIDER), kept out of git
+if [[ -f "$SCRIPT_DIR/local.env" ]]; then set -a; source "$SCRIPT_DIR/local.env"; set +a; fi
 ./setup.sh setup
 
 echo "$(date '+%Y-%m-%d %H:%M:%S') searxng-start: container ready, exec into proxy-manager"

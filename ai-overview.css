@@ -1,0 +1,18 @@
+#ai-overview { border: 1px solid var(--color-result-border, #ddd); border-radius: 10px; padding: 0.9rem 1rem; margin: 0 0 1.2rem; }
+#ai-overview .aio-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; }
+#ai-overview .aio-title { font-weight: 600; }
+#ai-overview .aio-head { gap: 0.5rem; }
+#ai-overview .aio-badge { font-size: 0.75rem; padding: 0.1rem 0.5rem; border-radius: 999px; border: 1px solid currentColor; opacity: 0.85; margin-right: auto; margin-left: 0.6rem; }
+#ai-overview .aio-badge.aio-sub { color: #2e9e4f; }
+#ai-overview .aio-badge.aio-api { color: #c98a00; }
+#ai-overview .aio-badge.aio-bad { color: #d1453b; }
+#ai-overview .aio-switch button { font-size: 0.8rem; margin-left: 0.3rem; padding: 0.1rem 0.5rem; border-radius: 6px; border: 1px solid currentColor; background: transparent; color: inherit; opacity: 0.6; cursor: pointer; }
+#ai-overview .aio-switch button.aio-on { opacity: 1; font-weight: 600; }
+#ai-overview .aio-a p { margin: 0.3rem 0; line-height: 1.5; }
+#ai-overview .aio-q { font-weight: 600; margin-top: 0.8rem; }
+#ai-overview .aio-wait { opacity: 0.6; font-style: italic; }
+#ai-overview .aio-err { opacity: 0.8; }
+#ai-overview .aio-cite { font-size: 0.8em; vertical-align: super; text-decoration: none; margin: 0 0.1em; }
+#ai-overview .aio-ask { display: flex; gap: 0.4rem; margin-top: 0.8rem; }
+#ai-overview .aio-ask input { flex: 1; padding: 0.35rem 0.5rem; border-radius: 6px; border: 1px solid var(--color-result-border, #ccc); background: transparent; color: inherit; }
+#ai-overview .aio-ask button { padding: 0.35rem 0.8rem; border-radius: 6px; border: 1px solid currentColor; background: transparent; color: inherit; cursor: pointer; }

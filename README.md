@@ -102,6 +102,20 @@ The dashboard, `/api/status` and `./setup.sh proxy status` read `.runtime/health
 ./setup.sh help          # Show all commands
 ```
 
+### AI overview (optional)
+
+Results pages can show a short AI answer above the results, like the overview on Google, built only from the results on that page, with numbered citations linking to them and a follow-up box. It is off by default. To enable it, create `local.env` next to `setup.sh` (gitignored):
+
+```bash
+SEARXNG_AI_PROVIDER=codex        # or: ollama, off
+# SEARXNG_OLLAMA_MODEL=llama3.1  # required for ollama
+```
+
+- `codex` uses the [Codex CLI](https://github.com/openai/codex) signed in with ChatGPT (`codex login`), so answers come from your ChatGPT plan's Codex allowance. Each answer takes about 10 to 20 seconds. Your query and the result snippets go to OpenAI.
+- `ollama` uses a local [Ollama](https://ollama.com) model: nothing leaves your machine.
+
+The panel lets you switch provider per query. Search results never wait for the answer.
+
 ### Status dashboard
 
 When proxy routing is active, visit [http://localhost:8080/stats](http://localhost:8080/stats) for a live dashboard showing whether each tunnel carries data (with exit IP, country and check age), whether the settings applied, engine routing, and the full health matrix. JSON endpoints are available at `/api/status` and `/api/log`.

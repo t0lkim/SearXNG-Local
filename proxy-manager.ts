@@ -5,8 +5,9 @@ import { openSync, closeSync } from "node:fs";
 import { createServer, connect } from "node:net";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
+import { aiEnabled, handleAiStatus, handleOverview, injectPanel, setAiRuntimeDir } from "./ai-overview.ts";
 
-const VERSION = "0.10.0";
+const VERSION = "0.11.0";
 
 const ROOT = import.meta.dir;
 const VPN_DIR = join(ROOT, "vpn-configs");
@@ -15,6 +16,7 @@ const TUNNEL_LOG_DIR = join(RUNTIME_DIR, "logs");
 const HEALTH_FILE = join(RUNTIME_DIR, "health-matrix.json");
 // The file this manager's own output goes to; launchers set it so the dashboard shows the live log
 const LOG_FILE = process.env.SEARXNG_PROXY_LOG || join(RUNTIME_DIR, "proxy-watch.log");
+setAiRuntimeDir(RUNTIME_DIR);
 const SEARXNG_INTERNAL_PORT = 8082;
 const SEARXNG_URL = `http://localhost:${SEARXNG_INTERNAL_PORT}`;
 const CONTAINER_NAME = "searxng";
@@ -623,7 +625,10 @@ async function checkTunnels(exits: Exit[], opts: { restart: boolean }): Promise<
     }
     if (dead.length > 0) {
       log(`restarting ${dead.length} tunnel(s) with no data: ${dead.map(e => e.name).join(", ")}`);
-      await Promise.all(dead.map(startTunnel));
+      const started = await Promise.all(dead.map(e => startTunnel(e)));
+      // No handshake means no session was opened on the VPN account, so there is nothing to back off from:
+      // retry next cycle, so tunnels recover promptly when the network allows WireGuard again
+      dead.forEach((e, i) => { if (!started[i]) restartBackoff.delete(e.name); });
       const again = await containerProbe(dead, []).catch(() => [] as ProbeOutput[]);
       for (const r of again) state.tunnels[r.name] = classifyTunnel(r.trace, hostIp);
     }
@@ -1128,10 +1133,18 @@ async function reprobeEngineLocked(url: URL): Promise<Response> {
 
 // ─── Status dashboard ──────────────────────────────────────
 
+// Only the dashboard and results pages served from this origin may call state-changing endpoints
+function crossOrigin(req: Request): boolean {
+  const site = req.headers.get("sec-fetch-site");
+  const origin = req.headers.get("origin");
+  const sameOrigin = origin === null || origin === `http://localhost:${PROXY_PORT}` || origin === `http://127.0.0.1:${PROXY_PORT}`;
+  return Boolean(site && site !== "same-origin" && site !== "none") || !sameOrigin;
+}
+
 function gateMessage(): string {
   if (!state.apply) return "Routes are not applied yet - the first tunnel probe is still running.";
   if (!state.apply.ok) return `Routing settings failed to apply: ${state.apply.detail}`;
-  return "No VPN tunnel is carrying traffic, so search is blocked rather than sent from this machine's own IP.";
+  return "No tunnel (VPN or Tor) is carrying traffic, so search is blocked rather than sent from this machine's own IP.";
 }
 
 function startStatusServer() {
@@ -1153,14 +1166,21 @@ function startStatusServer() {
         return statusLog(url);
       }
       if (url.pathname === "/api/reprobe" && req.method === "POST") {
-        // Only the dashboard itself may trigger a reprobe (it restarts the container); block cross-site posts
-        const site = req.headers.get("sec-fetch-site");
-        const origin = req.headers.get("origin");
-        const sameOrigin = origin === null || origin === `http://localhost:${PROXY_PORT}` || origin === `http://127.0.0.1:${PROXY_PORT}`;
-        if ((site && site !== "same-origin" && site !== "none") || !sameOrigin) {
-          return Response.json({ ok: false, error: "cross-origin request refused" }, { status: 403 });
-        }
+        // Reprobe restarts the container; only this origin may trigger it
+        if (crossOrigin(req)) return Response.json({ ok: false, error: "cross-origin request refused" }, { status: 403 });
         return reprobeEngine(url);
+      }
+      if (url.pathname === "/api/overview" && req.method === "POST") {
+        // Sends the query to the chosen AI provider; only this origin may trigger it
+        if (crossOrigin(req)) return Response.json({ ok: false, error: "cross-origin request refused" }, { status: 403 });
+        return handleOverview(req);
+      }
+      if (url.pathname === "/api/ai-status") {
+        return handleAiStatus();
+      }
+      if (url.pathname === "/ai-overview.js" || url.pathname === "/ai-overview.css") {
+        const type = url.pathname.endsWith(".js") ? "text/javascript" : "text/css";
+        return new Response(Bun.file(join(ROOT, url.pathname.slice(1))), { headers: { "Content-Type": `${type}; charset=utf-8` } });
       }
 
       if (!routingReady) {
@@ -1172,17 +1192,28 @@ function startStatusServer() {
 
       // Reverse-proxy everything else to SearXNG
       const target = `${SEARXNG_URL}${url.pathname}${url.search}`;
+      const isSearch = url.pathname === "/search" && aiEnabled();
+      // The search form may POST: buffer its small body so the query can be read and still forwarded
+      const bodyText = isSearch && req.method === "POST" ? await req.text() : null;
       try {
         const upstream = await fetch(target, {
           method: req.method,
           headers: req.headers,
-          body: req.method !== "GET" && req.method !== "HEAD" ? req.body : undefined,
+          body: bodyText ?? (req.method !== "GET" && req.method !== "HEAD" ? req.body : undefined),
           redirect: "manual",
           signal: AbortSignal.timeout(30_000),
         });
         const fwdHeaders = new Headers(upstream.headers);
         fwdHeaders.delete("content-encoding");
         fwdHeaders.delete("content-length");
+        if (isSearch && upstream.ok && (upstream.headers.get("content-type") ?? "").includes("text/html")) {
+          const query = url.searchParams.get("q") ?? new URLSearchParams(bodyText ?? "").get("q") ?? "";
+          return new Response(injectPanel(await upstream.text(), query), {
+            status: upstream.status,
+            statusText: upstream.statusText,
+            headers: fwdHeaders,
+          });
+        }
         return new Response(upstream.body, {
           status: upstream.status,
           statusText: upstream.statusText,

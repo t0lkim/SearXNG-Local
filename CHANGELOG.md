@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.11.0] - 2026-09-30
+
+- **New:** AI overview panel on results pages - a short answer above the results, grounded only in the results on the page, with `[n]` citations linking to them and a follow-up box. Results render immediately; the panel fills in when the answer arrives
+- **New:** Two providers, chosen with `SEARXNG_AI_PROVIDER` (`off` by default): `codex` runs OpenAI's Codex CLI on its ChatGPT sign-in; `ollama` uses a local Ollama model (`SEARXNG_OLLAMA_MODEL`). Switchable per query in the panel
+- **Security:** Codex runs with shell, browser, computer use, apps and plugins disabled, without user config, in an empty read-only sandbox; model output is rendered as text and only `[n]` citations become links; the overview endpoint refuses cross-origin requests
+- **New:** The panel shows who pays for each answer: a green "ChatGPT subscription" badge for a ChatGPT sign-in, amber "OpenAI API key · billed per use" for an API key, red when Codex is signed out, and the local model name for Ollama. Read from `codex login status`, never from Codex's token file
+- **New:** `searxng-start.sh` reads machine-local settings from a gitignored `local.env`
+- **Fix:** Tunnels that get no handshake at all (e.g. a network blocking UDP) are retried every cycle instead of backing off, since they open no VPN session; they recover within one cycle once UDP is allowed again
+- **Fix:** The blocked-search message no longer says "no VPN tunnel" while Tor is up
+
 ## [0.10.0] - 2026-09-25
 
 Tunnel health is now measured on the path search actually uses. Before this release the dashboard could show healthy routing while SearXNG had never sent a request through a tunnel.
