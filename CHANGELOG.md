@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.12.0] - 2026-09-30
+
+- **New:** Tunnels run on UDP 53 by default. Networks that restrict UDP almost always leave DNS open, so tunnels on 53 keep working if such a filter switches on mid-session. Proton accepts WireGuard on 53 with the same configs
+- **New:** UDP detection per network: before tunnels start (at startup, on a network change, or when every VPN tunnel is down), one throwaway tunnel tries each port in the ladder 53, 51820, 443, 4500, 1224, 88, 500, and all tunnels use the first that handshakes. Tunnels are stopped first so the probe never shares a live tunnel's key. Also checks whether port 53 is intercepted, by querying an address that runs no DNS server
+- **New:** `.runtime/network-events.jsonl` records each network join, detection and loss of all VPN tunnels (interface, MAC, gateway, local IP, per-port results, DNS interception, chosen port, minutes on the network), to diagnose filtering networks from facts
+- **New:** Dashboard and `status` show the network class (open, dns-only, restricted, blocked), the tunnel port and when it was checked
+- **New:** When a tunnel check fails because Apple's container runtime has stopped, the manager starts it and SearXNG again, but only when `container system status` says it is down
+- **Fix:** `bun test` runs without flags: `bunfig.toml` preloads the test environment (the AI panel test failed without `SEARXNG_AI_PROVIDER` set)
+- **Known:** Surviving a UDP filter that switches on mid-session is designed for but not yet verified against a live filtering network
+
 ## [0.11.0] - 2026-09-30
 
 - **New:** AI overview panel on results pages - a short answer above the results, grounded only in the results on the page, with `[n]` citations linking to them and a follow-up box. Results render immediately; the panel fills in when the answer arrives

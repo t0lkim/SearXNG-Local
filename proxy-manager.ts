@@ -6,14 +6,18 @@ import { createServer, connect } from "node:net";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { aiEnabled, handleAiStatus, handleOverview, injectPanel, setAiRuntimeDir } from "./ai-overview.ts";
+import { PORT_LADDER, currentNetwork, detectPorts, networkKey, recordEvidence, withEndpointPort, type Detection, type NetInfo } from "./udp-network.ts";
 
-const VERSION = "0.11.0";
+const VERSION = "0.12.0";
 
 const ROOT = import.meta.dir;
 const VPN_DIR = join(ROOT, "vpn-configs");
 const RUNTIME_DIR = join(ROOT, ".runtime");
 const TUNNEL_LOG_DIR = join(RUNTIME_DIR, "logs");
 const HEALTH_FILE = join(RUNTIME_DIR, "health-matrix.json");
+// One JSON line per network join, detection and loss of all VPN tunnels: the facts for diagnosing a filtering network
+const EVIDENCE_FILE = join(RUNTIME_DIR, "network-events.jsonl");
+const REDETECT_MIN_INTERVAL = 600_000;
 // The file this manager's own output goes to; launchers set it so the dashboard shows the live log
 const LOG_FILE = process.env.SEARXNG_PROXY_LOG || join(RUNTIME_DIR, "proxy-watch.log");
 setAiRuntimeDir(RUNTIME_DIR);
@@ -184,7 +188,15 @@ interface ApplyResult {
   detail: string;
 }
 
+interface NetworkState {
+  key: string;
+  joinedAt: string;
+  tunnelPort: number;
+  detection: Detection | null;
+}
+
 interface HealthMatrix {
+  network?: NetworkState;
   timestamp: string;
   probes: ExitProbe[];
   assignments: Record<string, string>;
@@ -421,6 +433,9 @@ async function rotateTorForEngine(tor: Exit, engine: string): Promise<EngineResu
 
 // ─── WireGuard → wireproxy config ───────────────────────────
 
+// UDP port every tunnel uses; set by detection, 53 until then (survives DNS-only filters)
+let tunnelPort = PORT_LADDER[0];
+
 function wgToWireproxyConfig(wgContent: string, socksPort: number): string {
   const lines: string[] = [];
   for (const raw of wgContent.split("\n")) {
@@ -436,7 +451,7 @@ function wgToWireproxyConfig(wgContent: string, socksPort: number): string {
     }
   }
   lines.push("", "[Socks5]", `BindAddress = ${TUNNEL_HOST}:${socksPort}`, "");
-  return lines.join("\n");
+  return withEndpointPort(lines.join("\n"), tunnelPort);
 }
 
 // ─── Exit discovery ─────────────────────────────────────────
@@ -596,7 +611,11 @@ async function checkTunnels(exits: Exit[], opts: { restart: boolean }): Promise<
   const hostIp = await hostPublicIp();
   let results: ProbeOutput[];
   try {
-    results = await containerProbe(exits, []);
+    // A dead container runtime fails every probe; one recovery attempt, then the same probe again
+    results = await containerProbe(exits, []).catch(async (e: unknown) => {
+      if (!await recoverRuntime()) throw e;
+      return containerProbe(exits, []);
+    });
   } catch (e: unknown) {
     const detail = `probe failed: ${e instanceof Error ? e.message : e}`;
     log(`✗ tunnel check ${detail}`);
@@ -647,6 +666,65 @@ async function checkTunnels(exits: Exit[], opts: { restart: boolean }): Promise<
   }
 }
 
+// ─── Network detection ──────────────────────────────────────
+
+let lastDetectAt = 0;
+let anyVpnWasUp = false;
+
+// Stops every tunnel, finds which UDP port reaches the VPN servers on this network, then starts them on it.
+// Tunnels are stopped first so the probe never shares a live tunnel's key.
+async function redetect(exits: Exit[], reason: string): Promise<void> {
+  const vpn = exits.filter(e => e.type === "vpn" && e.configFile);
+  if (vpn.length === 0) return;
+  await stopAllTunnels();
+  const info = await currentNetwork();
+  log(`detecting UDP (${reason}) on ${info.iface ?? "?"} via ${vpn[0].name}...`);
+  const wg = await readFile(vpn[0].configFile!, "utf-8");
+  const d = await detectPorts(wgToWireproxyConfig(wg, 0), WP_BIN, RUNTIME_DIR);
+  if (d.chosenPort !== null) tunnelPort = d.chosenPort;
+  const key = networkKey(info);
+  state.network = {
+    key,
+    joinedAt: state.network?.key === key ? state.network.joinedAt : new Date().toISOString(),
+    tunnelPort,
+    detection: d,
+  };
+  lastDetectAt = Date.now();
+  const portList = PORT_LADDER.map(p => `${p}${d.ports[p] ? "✓" : "✗"}`).join(" ");
+  log(`network ${d.netClass}: ${portList}; DNS intercepted: ${d.dnsIntercepted ?? "unknown"}; tunnels on UDP ${tunnelPort}`);
+  await recordEvidence(EVIDENCE_FILE, "detect", info, { reason, ...d, tunnelPort });
+  await saveState();
+  await startTunnels(exits);
+}
+
+// Runs each cycle before the tunnel check: a new network (gateway or address) means a fresh detection
+async function watchNetwork(exits: Exit[]): Promise<void> {
+  const info = await currentNetwork();
+  if (networkKey(info) === state.network?.key) return;
+  log(`network changed: ${info.iface ?? "?"} gateway ${info.gateway ?? "?"}`);
+  await recordEvidence(EVIDENCE_FILE, "network-changed", info, { previous: state.network?.key ?? null });
+  await redetect(exits, "network changed");
+}
+
+// Runs each cycle after the tunnel check: losing every VPN tunnel is recorded, and triggers a fresh detection
+async function watchVpnLoss(exits: Exit[]): Promise<void> {
+  const vpn = exits.filter(e => e.type === "vpn");
+  if (vpn.length === 0) return;
+  const anyUp = vpn.some(e => isUp(e.name));
+  if (!anyUp && anyVpnWasUp) {
+    const joined = state.network ? new Date(state.network.joinedAt).getTime() : Date.now();
+    await recordEvidence(EVIDENCE_FILE, "vpn-lost", await currentNetwork(), {
+      tunnelPort, minutesOnNetwork: Math.round((Date.now() - joined) / 60_000),
+    });
+  }
+  anyVpnWasUp = anyUp;
+  if (!anyUp && Date.now() - lastDetectAt >= REDETECT_MIN_INTERVAL) {
+    await redetect(exits, "all VPN tunnels down");
+    await checkTunnels(exits, { restart: false });
+    anyVpnWasUp = vpn.some(e => isUp(e.name));
+  }
+}
+
 // ─── Container settings ─────────────────────────────────────
 
 async function readContainerSettings(): Promise<string | null> {
@@ -661,6 +739,51 @@ async function getSecretKey(): Promise<string> {
     if (match) return match[1];
   }
   return randomBytes(16).toString("hex");
+}
+
+// `container system status` output, read literally: "running", "down" only when it says so, else "unknown"
+type RuntimeStatus = "running" | "down" | "unknown";
+function parseRuntimeStatus(code: number, out: string): RuntimeStatus {
+  if (/not running|not registered|^status\s+stopped\b/im.test(out)) return "down";
+  if (code === 0 && /^status\s+running\b/im.test(out)) return "running";
+  return "unknown";
+}
+
+async function runtimeStatus(): Promise<{ status: RuntimeStatus; detail: string }> {
+  try {
+    const r = await run(["container", "system", "status"], { timeout: 15_000 });
+    const out = `${r.stdout}\n${r.stderr}`.trim();
+    return { status: parseRuntimeStatus(r.code, out), detail: out.split("\n")[0] ?? "" };
+  } catch (e: unknown) {
+    return { status: "unknown", detail: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+// After a container command fails: asks the runtime whether it is running, and starts it (then SearXNG)
+// only when status says it is down. True means the runtime was down and is now back.
+async function recoverRuntime(): Promise<boolean> {
+  if (CONTAINER_RUNTIME !== "container") return false;
+  const before = await runtimeStatus();
+  if (before.status !== "down") {
+    log(`container runtime ${before.status} (${before.detail}): not starting it, the failure is elsewhere`);
+    return false;
+  }
+  log(`container runtime down (${before.detail}): starting it`);
+  try {
+    await runOk(["container", "system", "start"], { timeout: 120_000 });
+  } catch (e: unknown) {
+    log(`✗ container system start failed: ${e instanceof Error ? e.message : e}`);
+    return false;
+  }
+  const after = await runtimeStatus();
+  if (after.status !== "running") {
+    log(`✗ container runtime still ${after.status} after start (${after.detail})`);
+    return false;
+  }
+  await startContainer();
+  const ready = await waitForReady();
+  log(ready ? "✓ container runtime and SearXNG back" : "✗ runtime back but SearXNG did not become ready");
+  return ready;
 }
 
 async function startContainer(): Promise<void> {
@@ -948,10 +1071,11 @@ async function cmdStart() {
   console.log("Starting VPN tunnels...");
   killOrphanTunnels();
   await sweepRuntimeConfigs(exits);
-  await startTunnels(exits);
 
   await exclusive(async () => {
+    await redetect(exits, "startup");
     await checkTunnels(exits, { restart: true });
+    anyVpnWasUp = exits.some(e => e.type === "vpn" && isUp(e.name));
     await routeCycle(exits, "startup");
   });
   firstRouteDone = true;
@@ -973,7 +1097,9 @@ async function cmdStart() {
     }
 
     await exclusive(async () => {
+      await watchNetwork(exits);
       await checkTunnels(exits, { restart: true });
+      await watchVpnLoss(exits);
       const forced = Date.now() - lastFullProbe >= FORCED_PROBE_INTERVAL;
       const stale = routesStale(exits);
       if (configsChanged || forced || stale || !routingReady) {
@@ -1012,6 +1138,11 @@ async function cmdStatus() {
     return;
   }
 
+  const det = matrix.network?.detection;
+  if (det) {
+    console.log(`Network: ${det.netClass}, tunnels on UDP ${matrix.network!.tunnelPort}, DNS intercepted: ${det.dnsIntercepted ?? "unknown"} (${det.at})`);
+    console.log(`  ports: ${PORT_LADDER.map(p => `${p}${det.ports[p] ? "✓" : "✗"}`).join(" ")}\n`);
+  }
   console.log("Tunnels (data path through SearXNG's client):");
   for (const [name, t] of Object.entries(matrix.tunnels).sort()) {
     const age = Math.round((Date.now() - new Date(t.checkedAt).getTime()) / 60_000);
@@ -1313,6 +1444,10 @@ async function statusPage(): Promise<Response> {
   const applyText = !apply ? "not applied yet"
     : apply.ok ? `applied ${Math.round((Date.now() - new Date(apply.at).getTime()) / 60_000)}m ago`
     : `FAILED: ${esc(apply.detail)}`;
+  const det = matrix.network?.detection;
+  const netText = det
+    ? `${det.netClass} · UDP ${matrix.network!.tunnelPort}${det.dnsIntercepted ? " · DNS intercepted" : ""} · checked ${Math.round((Date.now() - new Date(det.at).getTime()) / 60_000)}m ago`
+    : "not detected yet";
   const statusRank: Record<string, number> = { down: 0, bypass: 1, unverified: 2, unchecked: 3, up: 4 };
 
   const html = `<!doctype html>
@@ -1359,7 +1494,7 @@ async function statusPage(): Promise<Response> {
 </head>
 <body>
 <h1>SearXNG Proxy Status <span class="muted" style="font-size:0.5em; font-weight:normal">v${VERSION}</span></h1>
-<p class="subtitle">Tunnels carrying data: <strong>${upCount}/${tunnels.length}</strong> &bull; Default exit: <strong>${esc(defaultExit)}</strong> &bull; Settings: <strong class="${apply?.ok ? "" : "bad"}">${applyText}</strong> &bull; Last engine probe: ${probeAge !== null ? `${probeAge}m ago` : "never"} &bull; Active engines: <strong>${activeCount}/${totalEnabled}</strong> <a class="refresh" onclick="location.reload()">refresh</a></p>
+<p class="subtitle">Network: <strong>${esc(netText)}</strong> &bull; Tunnels carrying data: <strong>${upCount}/${tunnels.length}</strong> &bull; Default exit: <strong>${esc(defaultExit)}</strong> &bull; Settings: <strong class="${apply?.ok ? "" : "bad"}">${applyText}</strong> &bull; Last engine probe: ${probeAge !== null ? `${probeAge}m ago` : "never"} &bull; Active engines: <strong>${activeCount}/${totalEnabled}</strong> <a class="refresh" onclick="location.reload()">refresh</a></p>
 ${routingReady ? "" : `<div class="banner"><strong>Search is blocked.</strong> ${esc(gateMessage())}</div>`}
 
 <div class="grid">
@@ -1515,7 +1650,7 @@ Prerequisites:
 `);
 }
 
-export { proxyUrl, classifyTunnel, optimise, settingsOptimal, textSince, restartDue, BLACKHOLE_PROXY };
+export { proxyUrl, classifyTunnel, optimise, settingsOptimal, textSince, restartDue, parseRuntimeStatus, BLACKHOLE_PROXY };
 export type { Exit, ExitProbe };
 
 if (import.meta.main) {

@@ -1,4 +1,4 @@
-// Run with: SEARXNG_AI_PROVIDER=codex bun test ai-overview.test.ts
+// Run with: bun test (bunfig.toml preloads the test environment)
 import { expect, test } from "bun:test";
 import { segments } from "./ai-overview.js";
 import { buildPrompt, classifyCodexStatus, injectPanel } from "./ai-overview.ts";

@@ -1,7 +1,7 @@
 // Run with: SEARXNG_RUNTIME=podman bun test
 // (forces the Podman addressing path so tests never call the container CLI)
 import { expect, test } from "bun:test";
-import { proxyUrl, classifyTunnel, optimise, settingsOptimal, textSince, restartDue, BLACKHOLE_PROXY, type Exit } from "./proxy-manager.ts";
+import { proxyUrl, classifyTunnel, optimise, settingsOptimal, textSince, restartDue, parseRuntimeStatus, BLACKHOLE_PROXY, type Exit } from "./proxy-manager.ts";
 
 const exits: Exit[] = [
   { name: "tor", type: "tor", port: 9050 },
@@ -79,4 +79,14 @@ test("a tunnel that stays dead is restarted on cycles 1, 2, 4, 8, 16, then every
   const due: number[] = [];
   for (let cycle = 1; cycle <= 40; cycle++) if (restartDue("dead-1")) due.push(cycle);
   expect(due).toEqual([1, 2, 4, 8, 16, 28, 40]);
+});
+
+// Real `container system status` output, captured 2026-09-30 (client 1.5.0)
+test("runtime status: down only when status says so, running only when it says so", () => {
+  expect(parseRuntimeStatus(1, "apiserver is not running and not registered with launchd")).toBe("down");
+  expect(parseRuntimeStatus(0, "FIELD               VALUE\nstatus              running\nclient.version      1.5.0")).toBe("running");
+  // Anything else is unknown, and unknown never starts the runtime
+  expect(parseRuntimeStatus(0, "")).toBe("unknown");
+  expect(parseRuntimeStatus(1, "XPC connection error: Connection invalid")).toBe("unknown");
+  expect(parseRuntimeStatus(1, "status              running")).toBe("unknown");
 });

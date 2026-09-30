@@ -83,6 +83,8 @@ The dashboard, `/api/status` and `./setup.sh proxy status` read `.runtime/health
 
 **Apple container networking:** the SearXNG VM cannot reach the Mac's loopback, so tunnels listen on the vmnet gateway (the host-only bridge shown by `container network list`), which is not exposed to your LAN. Tor stays on loopback; the manager relays the gateway's port 9050 to it, so no `torrc` change is needed.
 
+**Networks that block UDP:** WireGuard is UDP-only, and some public networks drop UDP except DNS. Tunnels therefore use UDP 53 by default (Proton accepts WireGuard there with the same configs). When a network blocks 53 too, detection picks the next port that works (51820, 443, 4500, 1224, 88, 500), and when nothing works Tor carries search. Each network the tunnels run on is recorded in `.runtime/network-events.jsonl`.
+
 **Connection limits:** each `.conf` in `vpn-configs/` holds one VPN connection open for as long as the manager runs, and counts against your provider's simultaneous-connection limit alongside your other devices. Configs beyond the limit can complete a handshake yet carry no data; keep the count within what your plan allows. Tunnels that carry no data are restarted with backoff (up to about once an hour) so they do not keep opening new sessions.
 
 **Note:** Bing serves Cloudflare Turnstile challenges to all known VPN and Tor IP ranges, so it will usually show as blocked in the health matrix. This is a Bing-side restriction with no workaround through proxy routing.
