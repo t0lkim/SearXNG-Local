@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.13.0] - 2026-10-16
+
+- **Fix:** The monitor loop skipped every route cycle. `checkTunnels` returned nothing on its success path, so the caller read `undefined` as a failed probe and returned early on each healthy cycle. Engine probing, VPN-loss handling and re-routing had not run since the process started: the engine matrix stayed ten days stale while all seven tunnels were up and search kept working on ten-day-old routes. The success path now returns true, and the function no longer writes the caller's flag
+- **New:** Sleep and wake no longer strand routing. The loop sleeps in short slices against the wall clock; a slice that overruns means the Mac slept, so the loop waits until the machine has stayed awake a full 15 s with a network before measuring anything, then acts at once rather than waiting out the interval
+- **New:** A tunnel probe that could not run reports `unknown`, not `down`. Nothing was measured, so the current routes are kept instead of being torn down, and the probe is retried up to three times, starting the container between attempts. A probe that spanned a sleep is discarded, as is a UDP detection that did
+- **New:** Quick route after a wake. Routing resumes from the last engine results, limited to the exits that are up now, with the first up VPN tunnel (else Tor) as the default when none are usable. The full engine probe refreshes it after, so search comes back in seconds rather than minutes
+- **New:** While anything is degraded the loop checks every minute instead of every five, and a SearXNG request that fails through the proxy ends the current wait so the next check starts immediately
+- **Changed:** Dashboard and `status` show `unknown` tunnels as a warning that the last probe could not run and routes were kept, rather than reporting that no engine can be routed
+
 ## [0.12.1] - 2026-09-30
 
 - **Fix:** The dashboard no longer counts missing evidence as health. With no tunnel carrying data it showed "All engines routing OK" and "Active engines 92/92". Engine status now comes only from engines whose routed exit is up now and whose last probe on that exit passed; with no tunnel up it says no engine can be routed. The count covers the 13 probed engines ("Engines verified X/13"), not SearXNG's whole engine list

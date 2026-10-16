@@ -8,7 +8,7 @@ import { randomBytes } from "node:crypto";
 import { aiEnabled, handleAiStatus, handleOverview, injectPanel, setAiRuntimeDir } from "./ai-overview.ts";
 import { PORT_LADDER, currentNetwork, detectPorts, isOnline, networkKey, recordEvidence, withEndpointPort, type Detection, type NetInfo } from "./udp-network.ts";
 
-const VERSION = "0.12.1";
+const VERSION = "0.13.0";
 
 const ROOT = import.meta.dir;
 const VPN_DIR = join(ROOT, "vpn-configs");
@@ -39,6 +39,12 @@ const ENGINE_TIMEOUT = 15;
 const HANDSHAKE_TIMEOUT = 10_000;
 const READY_TIMEOUT = 30_000;
 const MONITOR_INTERVAL = 300_000;
+// While anything is degraded (routing off, a probe failed, a routed exit down) the loop checks this often instead
+const FAST_INTERVAL = 60_000;
+// A 10 s sleep slice that took longer than this means the Mac slept through it
+const WAKE_GAP = 30_000;
+// A trace-only tunnel probe normally takes about 10 s; one that took this long spanned a sleep
+const PROBE_SPANNED_SLEEP = 120_000;
 const FORCED_PROBE_INTERVAL = 1_800_000;
 const PROXY_PORT = 8080;
 const TOR_CONTROL_PORT = 9051;
@@ -52,7 +58,6 @@ const TUNNEL_LOG_MAX = 1_000_000;
 const BLACKHOLE_PROXY = "socks5h://127.0.0.1:9";
 // Monitor loop must tick at least this often (wall clock) or the process exits for launchd to restart it
 const WATCHDOG_STALL_LIMIT = 3_600_000;
-const SLEEP_SLICE = 10_000;
 
 // ─── Process helpers (argv only, never a shell) ─────────────
 
@@ -172,7 +177,8 @@ interface ExitProbe {
 
 // up: carried data on SearXNG's path with an exit IP that is not the host's
 // down: no data; bypass: exit IP equals the host's own IP; unverified: host IP unknown, so bypass cannot be ruled out
-type TunnelStatus = "up" | "down" | "bypass" | "unverified";
+// unknown: the probe itself failed (e.g. the container VM still resuming), so nothing was measured
+type TunnelStatus = "up" | "down" | "bypass" | "unverified" | "unknown";
 
 interface TunnelState {
   status: TunnelStatus;
@@ -607,23 +613,41 @@ function restartDue(name: string): boolean {
   return true;
 }
 
-async function checkTunnels(exits: Exit[], opts: { restart: boolean }): Promise<void> {
+// Returns false when nothing could be measured. A failed probe says nothing about the tunnels, so they are
+// marked unknown (never down) and the caller keeps the current routes instead of tearing them down.
+async function checkTunnels(exits: Exit[], opts: { restart: boolean }): Promise<boolean> {
   const hostIp = await hostPublicIp();
-  let results: ProbeOutput[];
-  try {
-    // A dead container runtime fails every probe; one recovery attempt, then the same probe again
-    results = await containerProbe(exits, []).catch(async (e: unknown) => {
-      if (!await recoverRuntime()) throw e;
-      return containerProbe(exits, []);
-    });
-  } catch (e: unknown) {
-    const detail = `probe failed: ${e instanceof Error ? e.message : e}`;
-    log(`✗ tunnel check ${detail}`);
+  let results: ProbeOutput[] | null = null;
+  let lastError = "";
+  for (let attempt = 1; attempt <= 3 && !results; attempt++) {
+    const started = Date.now();
+    try {
+      // A dead container runtime fails every probe; recovery is tried once, on the first failure
+      results = await containerProbe(exits, []).catch(async (e: unknown) => {
+        if (attempt > 1 || !await recoverRuntime()) throw e;
+        return containerProbe(exits, []);
+      });
+      if (Date.now() - started > PROBE_SPANNED_SLEEP) {
+        results = null;
+        lastError = "the Mac slept during the probe";
+      }
+    } catch (e: unknown) {
+      lastError = e instanceof Error ? e.message : String(e);
+    }
+    if (!results && attempt < 3) {
+      // The SearXNG container itself may have stopped while the runtime runs; starting a running one is a no-op
+      await startContainer();
+      await Bun.sleep(10_000);
+    }
+  }
+  if (!results) {
+    const detail = `probe failed: ${lastError}`;
+    log(`✗ tunnel check ${detail} - keeping current routes, retrying shortly`);
     for (const exit of exits) {
-      state.tunnels[exit.name] = { status: "down", checkedAt: new Date().toISOString(), detail };
+      state.tunnels[exit.name] = { status: "unknown", checkedAt: new Date().toISOString(), detail };
     }
     await saveState();
-    return;
+    return false;
   }
   for (const r of results) state.tunnels[r.name] = classifyTunnel(r.trace, hostIp);
 
@@ -664,11 +688,13 @@ async function checkTunnels(exits: Exit[], opts: { restart: boolean }): Promise<
     const t = state.tunnels[exit.name];
     if (t && t.status !== "up") console.log(`    ${exit.name}: ${t.status}${t.detail ? ` (${t.detail})` : ""}`);
   }
+  return true;
 }
 
 // ─── Network detection ──────────────────────────────────────
 
 let lastDetectAt = 0;
+let probeOk = true;
 let anyVpnWasUp = false;
 
 // Stops every tunnel, finds which UDP port reaches the VPN servers on this network, then starts them on it.
@@ -690,9 +716,10 @@ async function redetect(exits: Exit[], reason: string): Promise<void> {
   await stopAllTunnels();
   log(`detecting UDP (${reason}) on ${info.iface ?? "?"} via ${vpn[0].name}...`);
   const wg = await readFile(vpn[0].configFile!, "utf-8");
+  const detectStarted = Date.now();
   const d = await detectPorts(wgToWireproxyConfig(wg, 0), WP_BIN, RUNTIME_DIR);
   const after = await currentNetwork();
-  if (networkKey(after) !== key) {
+  if (networkKey(after) !== key || Date.now() - detectStarted > PROBE_SPANNED_SLEEP) {
     // The network changed while probing: these results describe neither network, so discard them
     log(`network changed during detection - discarding results, will detect again`);
     await recordEvidence(EVIDENCE_FILE, "detect-discarded", after, { reason, before: key });
@@ -1029,6 +1056,30 @@ async function routeCycle(exits: Exit[], reason: string): Promise<void> {
   await saveState();
 }
 
+// Routes from the last engine results, limited to exits that are up now; with none, the first up VPN tunnel
+// (else Tor) as default. Lets search resume at once after a wake; the full engine probe refreshes it after.
+function pickQuickRoute(probes: ExitProbe[], up: Exit[]): { assignments: Record<string, string>; defaultExit: string | null } {
+  const upNames = new Set(up.map(e => e.name));
+  const known = optimise(probes.filter(p => upNames.has(p.exit) && p.engines.length > 0));
+  if (known.defaultExit) return known;
+  const fallback = up.find(e => e.type === "vpn") ?? up[0];
+  return { assignments: {}, defaultExit: fallback?.name ?? null };
+}
+
+async function quickRoute(exits: Exit[]): Promise<void> {
+  const up = exits.filter(e => isUp(e.name));
+  const { assignments, defaultExit } = pickQuickRoute(state.probes, up);
+  if (!defaultExit) return;
+  const apply = await applySettings(settingsOptimal(await getSecretKey(), exits, assignments, defaultExit));
+  state.apply = apply;
+  if (apply.ok) {
+    state.assignments = { _default: defaultExit, ...assignments };
+    routingReady = true;
+    log(`quick route: default ${defaultExit} from last engine results (${apply.detail}); full engine probe follows`);
+  }
+  await saveState();
+}
+
 // True when the applied routes use a tunnel that is no longer up, or an up tunnel is missing from the last probe
 function routesStale(exits: Exit[]): boolean {
   const routed = new Set(Object.values(state.assignments));
@@ -1058,10 +1109,35 @@ function checkWatchdog(): void {
   stopAllTunnels().finally(() => process.exit(1));
 }
 
-// Sleep against the wall clock in short slices, so a timer lost across macOS sleep/wake cannot park the loop
-async function sleepWall(ms: number): Promise<void> {
+// Sleep against the wall clock in short slices, so a timer lost across macOS sleep/wake cannot park the loop.
+// Returns true, early, when a slice overran by more than WAKE_GAP: the Mac slept, so the loop should act now.
+// Set by the reverse proxy when SearXNG fails a request: ends the current wait so the loop checks at once
+let kicked = false;
+function kickMonitor(): void { kicked = true; }
+
+async function sleepWall(ms: number): Promise<boolean> {
   const deadline = Date.now() + ms;
-  while (Date.now() < deadline) await Bun.sleep(Math.min(SLEEP_SLICE, deadline - Date.now()));
+  while (Date.now() < deadline) {
+    if (kicked) { kicked = false; return false; }
+    const slice = Math.min(2_000, deadline - Date.now());
+    const t = Date.now();
+    await Bun.sleep(slice);
+    if (Date.now() - t - slice > WAKE_GAP) return true;
+  }
+  return false;
+}
+
+// After a sleep: wait until the Mac has stayed awake for a full 15 s (DarkWakes last only seconds) and has a
+// network, so nothing is measured or torn down while it is half-asleep. Gives up waiting after 3 minutes.
+async function settleAfterWake(): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < 180_000) {
+    const t = Date.now();
+    await Bun.sleep(15_000);
+    const stayedAwake = Date.now() - t < 15_000 + WAKE_GAP;
+    if (stayedAwake && isOnline(await currentNetwork())) break;
+  }
+  log(`woke from sleep: settled after ${Math.round((Date.now() - started) / 1000)} s`);
 }
 
 // ─── CLI commands ───────────────────────────────────────────
@@ -1092,7 +1168,7 @@ async function cmdStart() {
 
   await exclusive(async () => {
     await redetect(exits, "startup");
-    await checkTunnels(exits, { restart: true });
+    probeOk = await checkTunnels(exits, { restart: true });
     anyVpnWasUp = exits.some(e => e.type === "vpn" && isUp(e.name));
     await routeCycle(exits, "startup");
   });
@@ -1103,7 +1179,12 @@ async function cmdStart() {
 
   while (true) {
     lastLoopTick = Date.now();
-    await sleepWall(MONITOR_INTERVAL);
+    const routedDown = Object.values(state.assignments).some(name => !isUp(name));
+    const degraded = !routingReady || !probeOk || routedDown;
+    if (await sleepWall(degraded ? FAST_INTERVAL : MONITOR_INTERVAL)) {
+      lastLoopTick = Date.now();
+      await settleAfterWake();
+    }
 
     const fresh = await discoverExits();
     const before = exits.map(e => e.name).join();
@@ -1116,8 +1197,11 @@ async function cmdStart() {
 
     await exclusive(async () => {
       await watchNetwork(exits);
-      await checkTunnels(exits, { restart: true });
+      probeOk = await checkTunnels(exits, { restart: true });
+      // Nothing was measured: keep the current routes (they never egress directly) and retry on the fast cadence
+      if (!probeOk) return;
       await watchVpnLoss(exits);
+      if (!routingReady || routesStale(exits)) await quickRoute(exits);
       const forced = Date.now() - lastFullProbe >= FORCED_PROBE_INTERVAL;
       const stale = routesStale(exits);
       if (configsChanged || forced || stale || !routingReady) {
@@ -1370,6 +1454,7 @@ function startStatusServer() {
         });
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
+        kickMonitor();
         return new Response(`SearXNG unavailable: ${msg}\n`, { status: 502 });
       }
     },
@@ -1480,7 +1565,7 @@ async function statusPage(): Promise<Response> {
   const netText = det
     ? `${det.netClass === "offline" ? "offline · no network" : det.netClass === "blocked" ? "blocked · no UDP port reaches the VPN servers" : `${det.netClass} · UDP ${matrix.network!.tunnelPort}`}${det.dnsIntercepted ? " · DNS intercepted" : ""} · checked ${Math.round((Date.now() - new Date(det.at).getTime()) / 60_000)}m ago`
     : "not detected yet";
-  const statusRank: Record<string, number> = { down: 0, bypass: 1, unverified: 2, unchecked: 3, up: 4 };
+  const statusRank: Record<string, number> = { down: 0, bypass: 1, unverified: 2, unknown: 3, unchecked: 4, up: 5 };
 
   const html = `<!doctype html>
 <html lang="en">
@@ -1537,7 +1622,9 @@ ${routingReady ? "" : `<div class="banner"><strong>Search is blocked.</strong> $
       <tr><th>Engine</th><th>Exit</th><th>Status</th><th></th></tr>
       <tbody id="engine-rows">
       ${health.noRoute
-        ? '<tr><td colspan="4" class="bad">No tunnel is carrying data, so no engine can be routed.</td></tr>'
+        ? (tunnels.some(t => t.status === "unknown")
+          ? '<tr><td colspan="4" class="warn">Tunnel status unknown: the last probe could not run. Current routes kept; retrying every minute.</td></tr>'
+          : '<tr><td colspan="4" class="bad">No tunnel is carrying data, so no engine can be routed.</td></tr>')
         : health.issues.map(i => {
         const statusClass = i.status === "timeout" ? "warn" : i.status === "not probed" ? "muted" : "bad";
         return `<tr class="engine-row"><td>${esc(i.engine)}</td><td><span class="tag ${i.custom ? "routed" : "default"}">${esc(i.route)}</span></td><td class="${statusClass}">${esc(i.status)}</td><td><button class="reprobe-btn" onclick="reprobe('${esc(i.engine)}', this)">reprobe</button></td></tr>`;
@@ -1561,7 +1648,7 @@ ${routingReady ? "" : `<div class="banner"><strong>Search is blocked.</strong> $
       <tr><th>Exit</th><th>Country</th><th>Exit IP</th><th>Status</th><th>Checked</th></tr>
       <tbody id="tunnel-rows">
       ${tunnels.sort((a, b) => (statusRank[a.status] - statusRank[b.status]) || a.country.localeCompare(b.country) || a.name.localeCompare(b.name, undefined, { numeric: true })).map(t => {
-        const cls = t.status === "up" ? "ok" : t.status === "unverified" || t.status === "unchecked" ? "warn" : "bad";
+        const cls = t.status === "up" ? "ok" : t.status === "unverified" || t.status === "unchecked" || t.status === "unknown" ? "warn" : "bad";
         return `<tr class="tunnel-row" title="${esc(t.detail)}"><td><span class="dot ${t.status}"></span>${esc(t.name)}</td><td class="muted">${esc(t.country)}</td><td class="muted">${esc(t.exitIp)}${t.loc ? ` (${esc(t.loc)})` : ""}</td><td class="${cls}">${t.status}</td><td class="muted">${t.ageMin === null ? "-" : `${t.ageMin}m ago`}</td></tr>`;
       }).join("\n      ")}
       </tbody>
@@ -1675,7 +1762,7 @@ Prerequisites:
 `);
 }
 
-export { proxyUrl, classifyTunnel, optimise, settingsOptimal, textSince, restartDue, parseRuntimeStatus, engineHealth, BLACKHOLE_PROXY };
+export { proxyUrl, classifyTunnel, optimise, settingsOptimal, textSince, restartDue, parseRuntimeStatus, engineHealth, pickQuickRoute, BLACKHOLE_PROXY };
 export type { Exit, ExitProbe };
 
 if (import.meta.main) {

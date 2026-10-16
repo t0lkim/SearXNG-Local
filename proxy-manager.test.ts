@@ -1,7 +1,7 @@
 // Run with: SEARXNG_RUNTIME=podman bun test
 // (forces the Podman addressing path so tests never call the container CLI)
 import { expect, test } from "bun:test";
-import { proxyUrl, classifyTunnel, optimise, settingsOptimal, textSince, restartDue, parseRuntimeStatus, engineHealth, BLACKHOLE_PROXY, type Exit } from "./proxy-manager.ts";
+import { proxyUrl, classifyTunnel, optimise, settingsOptimal, textSince, restartDue, parseRuntimeStatus, engineHealth, pickQuickRoute, BLACKHOLE_PROXY, type Exit } from "./proxy-manager.ts";
 
 const exits: Exit[] = [
   { name: "tor", type: "tor", port: 9050 },
@@ -114,4 +114,20 @@ test("engine health: engines never probed are 'not probed', not OK", () => {
   const h = engineHealth(matrix, new Set(["de-1"]));
   expect(h.ok).toBe(0);
   expect(h.issues.every(i => i.status === "not probed")).toBe(true);
+});
+
+test("quick route after wake reuses last engine results, limited to exits that are up now", () => {
+  const probes = [
+    { exit: "de-1", engines: [{ engine: "a", status: "ok" as const }, { engine: "q", status: "blocked" as const }] },
+    { exit: "fr-2", engines: [{ engine: "q", status: "ok" as const }] },
+  ];
+  expect(pickQuickRoute(probes, [exits[1], exits[2]])).toEqual({ defaultExit: "de-1", assignments: { q: "fr-2" } });
+  // fr-2 not up: its results are ignored, so q is not routed there
+  expect(pickQuickRoute(probes, [exits[1]])).toEqual({ defaultExit: "de-1", assignments: {} });
+});
+
+test("quick route with no usable results falls back to the first up VPN tunnel, then Tor, then none", () => {
+  expect(pickQuickRoute([], [exits[0], exits[2]]).defaultExit).toBe("fr-2");
+  expect(pickQuickRoute([], [exits[0]]).defaultExit).toBe("tor");
+  expect(pickQuickRoute([], []).defaultExit).toBe(null);
 });
